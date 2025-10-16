@@ -144,38 +144,45 @@ export class DataAgentService {
     return result;
   }
 
-  async analyzeAndProcess(data: string) {
+  async analyzeAndProcess(data: string, fileName: string, tags?: string) {
     const analysis = await this.analyzeData(data);
     const processedData = await this.executeActions(data, analysis);
+
+    // Guardar en DB usando saveProcessedFile
+    const saved = await this.saveProcessedFile({
+      title: fileName,
+      content: processedData,
+      tags,
+    });
+
     return {
       analysis,
       processedData,
+      recordId: saved.id,
     };
   }
 
-  private generateTags(analysis: any): string {
-    const tags: string[] = [];
-    
-    if (analysis.needs_cleaning) tags.push('cleaned');
-    if (analysis.needs_transformation) tags.push('transformed');
-    if (analysis.needs_validation) tags.push('validated');
-    if (analysis.raw_text_allowed) tags.push('raw-text');
-    
-    // Add timestamp-based tag
-    tags.push(`processed-${new Date().toISOString().split('T')[0]}`);
-    
-    return tags.join(',');
+  async saveProcessedFile(params: {
+    title: string;             // p.ej. nombre original del archivo
+    content: string;           // el texto procesado que guardaremos
+    tags?: string;             // tags opcionales (comma-separated)
+  }) {
+    const entity = this.knowledgeBaseRepository.create({
+      title: params.title,
+      content: params.content,
+      tags: params.tags,
+    });
+    const saved = await this.knowledgeBaseRepository.save(entity);
+    return saved; // contiene id, createdAt, etc.
   }
-  private generateTitle(data: string, fileType?: string): string {
-    const preview = data.substring(0, 50).replace(/[\r\n]+/g, ' ').trim();
-    const timestamp = new Date().toISOString().split('T')[0];
-    
-    if (fileType) {
-      return `${fileType.toUpperCase()} - ${timestamp}`;
-    }
-    
-    return `Data ${timestamp} - ${preview}...`;
-  }
+
   
+   async loadContext(recordId: string) {
+    const record = await this.knowledgeBaseRepository.findOne({
+      where: { id: recordId },
+    });
+    if (!record) throw new Error(`No context found for id=${recordId}`);
+    return record; // title, content, tags, createdAt
+  }
   
 }
