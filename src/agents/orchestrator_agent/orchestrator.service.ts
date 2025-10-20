@@ -240,9 +240,9 @@ Provide your workflow plan:`;
     
     for (const [key, value] of Object.entries(enriched)) {
       if (typeof value === 'string') {
-        // Match both {{task.0.field}} and ${task.0.field} patterns
-        const match = value.match(/(?:\{\{|\$\{)task\.(\d+)\.(\w+)\}\}/);
-        if (match) {
+        // Match single braces {task.0.field}, double braces {{task.0.field}}, or ${task.0.field}
+        const match = value.match(/\{?\{?task\.(\d+)\.(\w+)\}?\}?/);
+        if (match && match[0].includes('task.')) {
           const [fullMatch, taskIdx, field] = match;
           const taskResult = previousResults[parseInt(taskIdx)];
           if (taskResult && taskResult[field] !== undefined) {
@@ -250,6 +250,7 @@ Provide your workflow plan:`;
             enriched[key] = taskResult[field];
           } else {
             console.warn(`✗ Could not resolve ${fullMatch}: task result not found or field missing`);
+            console.warn(`  Available fields in task ${taskIdx} result:`, taskResult ? Object.keys(taskResult) : 'no result');
           }
         }
       }
