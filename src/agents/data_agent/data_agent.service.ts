@@ -435,6 +435,7 @@ Provide your analysis:`;
   }
 
   async findRecordByFilename(filename: string) {
+    filename = filename.replace(/\.[^/.]+$/, ""); // Remove extension if present
     const record = await this.knowledgeBaseRepository.findOne({
       where: { title: filename },
     });
@@ -533,7 +534,7 @@ Provide your analysis:`;
       content: params.content,
       raw_content: params.content,
       analysis_summary: 'No summary yet',
-      original_filename: params.title,
+      filename: params.title,
       file_type: extension,
       tags: params.tags,
     });

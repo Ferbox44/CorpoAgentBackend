@@ -14,18 +14,18 @@ export class KnowledgeBase {
   @Column({ type: 'varchar', length: 100, nullable: true })
   tags: string;
 
-  @Column({ type: 'text', nullable: true })
-raw_content: string;
-
-@Column({ type: 'text', nullable: true })
-analysis_summary: string;
-
-@Column({ type: 'varchar', length: 100, nullable: true })
-original_filename: string;
-
-@Column({ type: 'varchar', length: 20, nullable: true })
-file_type: string;
-
+  @Column({ type: 'text', nullable: true }) 
+  raw_content: string; 
+  
+  @Column({ type: 'text', nullable: true }) 
+  analysis_summary: string; 
+  
+  @Column({ type: 'varchar', length: 100, nullable: true }) 
+  filename: string; 
+  
+  @Column({ type: 'varchar', length: 20, nullable: true }) 
+  file_type: string;
+  
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }
