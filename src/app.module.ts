@@ -6,14 +6,12 @@ import { User } from './entities/users.entity';
 import { ChatSession } from './entities/chat_session.entity';
 import { Message } from './entities/message.entity';
 import { KnowledgeBase } from './entities/knowledge_base.entity';
-import { DataAgentModule } from './agents/data_agent/data_agent.module';
-import { OrchestratorModule } from './agents/orchestrator_agent/orchestrator.module';
-import { ReportAgentModule } from './agents/report_agent/report_agent.module';
+
+import { UnifiedAgentModule } from './agents/uni-agent/uni-agent.module';
 @Module({
   imports: [
-    DataAgentModule,
-    OrchestratorModule,
-    ReportAgentModule,
+    
+    UnifiedAgentModule,
     TypeOrmModule.forRoot({
       type: 'postgres',
       host: process.env.DB_HOST,

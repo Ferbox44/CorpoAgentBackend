@@ -103,6 +103,11 @@ EXAMPLES:
   Task 0: process_data (data will be auto-injected from context)
   Task 1: generate_report with recordId="{{task.0.recordId}}"
 
+-"Process this data, clean it, and then generate a complete report and export it to PDF "→
+  Task 0: process_data (data will be auto-injected from context)
+  Task 1: generate_report with recordId="{{task.0.recordId}}"
+  Task 2: export_pdf with recordId="{{task.0.recordId}}" 
+
 USER REQUEST:
 {request}
 
