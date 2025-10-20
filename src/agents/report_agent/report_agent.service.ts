@@ -142,7 +142,7 @@ Respond with only the JSON object:`;
     this.insightsChain = RunnableSequence.from([
       insightsPrompt,
       this.model,
-      (output: AIMessage | string) => this.parseJSON(output, insightsParser)
+      (output: AIMessage | string) => this.parseJSON(output, insightsParser),
     ]);
   }
 
@@ -311,8 +311,7 @@ Respond with only the JSON object:`;
   }): Promise<GeneratedReport> {
     console.log('=== REPORT AGENT: Generating Report ===');
     console.log('Params:', params);
-    console.log('UUID: ' , params.recordId);
-    
+
     // Get data from various sources
     let data: string;
     let sourceInfo: string;

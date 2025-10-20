@@ -100,7 +100,7 @@ EXAMPLES:
   Task 1: generate_report with recordId="{{task.0.id}}"
   
 - "Process this new data and report" → 
-  Task 0: process_data with data from context
+  Task 0: process_data (data will be auto-injected from context)
   Task 1: generate_report with recordId="{{task.0.recordId}}"
 
 USER REQUEST:
@@ -121,6 +121,7 @@ Provide your workflow plan:`;
   async processRequest(request: string, context?: any): Promise<any> {
     console.log('=== ORCHESTRATOR: Processing Request ===');
     console.log('Request:', request);
+    console.log('Context:', JSON.stringify(context, null, 2));
 
     const plan = await this.planWorkflow(request, context);
     console.log('Workflow plan:', JSON.stringify(plan, null, 2));
@@ -205,35 +206,18 @@ Provide your workflow plan:`;
   }
 
   private async executeTask(task: AgentTask, previousResults: any[], context?: any): Promise<any> {
-    let params = this.enrichParams(task.params, previousResults);
+    console.log('\n--- Executing Task ---');
+    console.log('Original params:', JSON.stringify(task.params, null, 2));
+    console.log('Context available:', !!context);
     
+    // First resolve task dependencies
+    let params = this.enrichParams(task.params, previousResults);
+    console.log('After task dependency resolution:', JSON.stringify(params, null, 2));
+    
+    // Then inject context values
     if (context) {
-      console.log('Injecting context into task params...');
-      
-      for (const [key, value] of Object.entries(params)) {
-        if (typeof value === 'string') {
-          const match = value.match(/(?:\{\{|\$\{)context\.(\w+)\}\}/);
-          if (match) {
-            const [, field] = match;
-            if (context[field] !== undefined) {
-              console.log(`Replacing ${value} with context.${field}`);
-              params[key] = context[field];
-            }
-          }
-        }
-      }
-      
-      if (context.fileData && !params.fileData && !params.data) {
-        console.log('Auto-injecting fileData from context');
-        params.fileData = context.fileData;
-      }
-      
-      if (context.filename && !params.filename) {
-        console.log('Auto-injecting filename from context');
-        params.filename = context.filename;
-      }
-      
-      params._context = context;
+      params = this.injectContextIntoParams(params, context);
+      console.log('After context injection:', JSON.stringify(params, null, 2));
     }
 
     switch (task.agent) {
@@ -256,13 +240,16 @@ Provide your workflow plan:`;
     
     for (const [key, value] of Object.entries(enriched)) {
       if (typeof value === 'string') {
+        // Match both {{task.0.field}} and ${task.0.field} patterns
         const match = value.match(/(?:\{\{|\$\{)task\.(\d+)\.(\w+)\}\}/);
         if (match) {
-          const [, taskIdx, field] = match;
+          const [fullMatch, taskIdx, field] = match;
           const taskResult = previousResults[parseInt(taskIdx)];
           if (taskResult && taskResult[field] !== undefined) {
-            console.log(`Replacing ${value} with result from task ${taskIdx}.${field}`);
+            console.log(`✓ Replacing ${fullMatch} with result from task ${taskIdx}.${field} = ${taskResult[field]}`);
             enriched[key] = taskResult[field];
+          } else {
+            console.warn(`✗ Could not resolve ${fullMatch}: task result not found or field missing`);
           }
         }
       }
@@ -271,32 +258,82 @@ Provide your workflow plan:`;
     return enriched;
   }
 
+  private injectContextIntoParams(params: any, context: any): any {
+    const enriched = { ...params };
+    
+    console.log('Injecting context into params...');
+    console.log('Available context keys:', Object.keys(context));
+    
+    // Resolve context placeholders in param values
+    for (const [key, value] of Object.entries(enriched)) {
+      if (typeof value === 'string') {
+        // Match both {{context.field}} and ${context.field} patterns
+        const match = value.match(/(?:\{\{|\$\{)context\.(\w+)\}\}/);
+        if (match) {
+          const [fullMatch, field] = match;
+          if (context[field] !== undefined) {
+            console.log(`✓ Replacing ${fullMatch} with context.${field}`);
+            enriched[key] = context[field];
+          } else {
+            console.warn(`✗ Context field "${field}" not found in context`);
+          }
+        }
+      }
+    }
+    
+    // Auto-inject common context fields if not already present
+    if (context.fileData && !enriched.fileData && !enriched.data) {
+      console.log('✓ Auto-injecting fileData from context');
+      enriched.fileData = context.fileData;
+    }
+    
+    if (context.filename && !enriched.filename) {
+      console.log('✓ Auto-injecting filename from context');
+      enriched.filename = context.filename;
+    }
+    
+    if (context.recordId && !enriched.recordId) {
+      console.log('✓ Auto-injecting recordId from context');
+      enriched.recordId = context.recordId;
+    }
+    
+    return enriched;
+  }
+
   private async executeDataAgentTask(action: string, params: any): Promise<any> {
-    console.log('Executing DATA agent action:', action, params);
+    console.log('Executing DATA agent action:', action);
+    console.log('Final params:', JSON.stringify(params, null, 2));
     
     switch (action) {
       case 'analyze_data':
         return this.dataAgentService.analyzeData(params.data);
       
       case 'get_by_id':
+        if (!params.id) {
+          throw new Error('Missing required parameter: id');
+        }
         return this.dataAgentService.getRecordById(params.id);
       
       case 'get_by_filename':
+        if (!params.filename) {
+          throw new Error('Missing required parameter: filename');
+        }
         return this.dataAgentService.findRecordByFilename(params.filename);
       
       case 'process_data':
       case 'upload_and_process':
-        const context = params._context || {};
-        const data = params.fileData || params.data || context.fileData;
-        const filename = params.filename || context.filename || 'uploaded_file.csv';
+        const data = params.fileData || params.data;
+        const filename = params.filename || 'uploaded_file.csv';
         const tags = params.tags;
         
         if (!data) {
-          throw new Error('No data provided for processing');
+          throw new Error('No data provided for processing. Ensure fileData or data is in params.');
         }
         
-        console.log('Processing data with filename:', filename);
-        console.log('Data length:', data.length);
+        console.log('Processing data:');
+        console.log('  - filename:', filename);
+        console.log('  - data length:', data.length);
+        console.log('  - tags:', tags);
         
         return this.dataAgentService.analyzeAndProcess(data, filename, tags);
       
@@ -306,10 +343,14 @@ Provide your workflow plan:`;
   }
 
   private async executeReportAgentTask(action: string, params: any): Promise<any> {
-    console.log('Executing REPORT agent action:', action, params);
+    console.log('Executing REPORT agent action:', action);
+    console.log('Final params:', JSON.stringify(params, null, 2));
     
     switch (action) {
       case 'generate_report':
+        if (!params.recordId && !params.filename && !params.data) {
+          throw new Error('Missing required parameter: recordId, filename, or data');
+        }
         return this.reportAgentService.generateReport({
           recordId: params.recordId,
           filename: params.filename,
@@ -318,6 +359,9 @@ Provide your workflow plan:`;
         });
       
       case 'create_summary':
+        if (!params.recordId && !params.filename && !params.data) {
+          throw new Error('Missing required parameter: recordId, filename, or data');
+        }
         return this.reportAgentService.createSummary({
           recordId: params.recordId,
           filename: params.filename,
@@ -352,6 +396,9 @@ Provide your workflow plan:`;
         return this.reportAgentService.formatReportAsJson(jsonReport);
       
       case 'get_statistics':
+        if (!params.data) {
+          throw new Error('Missing required parameter: data');
+        }
         return this.reportAgentService.getDataStatistics(params.data);
       
       default:
@@ -389,6 +436,7 @@ Provide your workflow plan:`;
   async processFileUpload(file: Express.Multer.File, request: string): Promise<any> {
     console.log('=== ORCHESTRATOR: Processing File Upload ===');
     console.log('Filename:', file.originalname);
+    console.log('File size:', file.size);
     console.log('Request:', request);
 
     const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
@@ -412,6 +460,9 @@ Provide your workflow plan:`;
       throw new Error('File appears to be empty or could not be read');
     }
 
+    console.log('Extracted text length:', text.length);
+    console.log('First 100 chars:', text.substring(0, 100));
+
     const context = {
       filename: file.originalname,
       fileSize: file.size,
@@ -423,7 +474,7 @@ Provide your workflow plan:`;
       A file named "${file.originalname}" has been uploaded and extracted.
       Task: ${request}
       
-      The file data is ready to be processed and saved to the database.
+      The file data is available in the context and ready to be processed and saved to the database.
     `;
 
     return this.processRequest(enhancedRequest, context);
