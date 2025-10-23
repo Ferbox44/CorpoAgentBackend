@@ -11,16 +11,6 @@ services:
     ports:
       - "5432:5432"
     
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-
   pgadmin:
     image: dpage/pgadmin4
     container_name: corpoagent_pgadmin

@@ -1,15 +1,22 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ChatOllama } from '@langchain/ollama';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { z } from 'zod';
-import { StructuredOutputParser } from 'langchain/output_parsers';
+import { StructuredOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence } from '@langchain/core/runnables';
 import { KnowledgeBase } from '../../entities/knowledge_base.entity';
 import { AIMessage } from '@langchain/core/messages';
 
-interface Task {
+interface Tool {
+  name: string;
+  description: string;
+  call: (data: string) => string;
+}
+
+interface AgentTask {
+  agent: string;
   action: string;
   params: any;
   status: 'pending' | 'running' | 'completed' | 'failed';
@@ -18,7 +25,7 @@ interface Task {
 }
 
 interface WorkflowPlan {
-  tasks: Task[];
+  tasks: AgentTask[];
   reasoning: string;
 }
 
@@ -43,28 +50,232 @@ export interface GeneratedReport {
   recommendations?: string[];
 }
 
+function parseCSV(data: string): { headers: string[], rows: string[][] } {
+  // Handle both actual newlines and literal \n strings
+  const normalizedData = data.replace(/\\n/g, '\n');
+  const lines = normalizedData.trim().split('\n').filter(line => line.trim().length > 0);
+  
+  if (lines.length < 2) {
+    throw new Error('Invalid CSV: needs at least header and one row');
+  }
+  
+  // Parse a single CSV line handling quotes
+  function parseCSVLine(line: string): string[] {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      const nextChar = line[i + 1];
+      
+      if (char === '"') {
+        if (inQuotes && nextChar === '"') {
+          // Escaped quote
+          current += '"';
+          i++; // Skip next quote
+        } else {
+          // Toggle quote mode
+          inQuotes = !inQuotes;
+        }
+      } else if (char === ',' && !inQuotes) {
+        // End of field
+        result.push(current.trim());
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    
+    // Add last field
+    result.push(current.trim());
+    return result;
+  }
+  
+  const headers = parseCSVLine(lines[0]).map(h => h.toLowerCase());
+  const headerCount = headers.length;
+  
+  const rows = lines.slice(1).map((line, idx) => {
+    const cells = parseCSVLine(line);
+    
+    // Pad row if it has fewer cells than headers
+    while (cells.length < headerCount) {
+      console.warn(`Row ${idx + 2} has ${cells.length} cells but expected ${headerCount}. Padding with empty string.`);
+      cells.push('');
+    }
+    
+    // Truncate row if it has more cells than headers
+    if (cells.length > headerCount) {
+      console.warn(`Row ${idx + 2} has ${cells.length} cells but expected ${headerCount}. Truncating from ${cells.length} to ${headerCount}.`);
+      console.warn(`Extra values: ${cells.slice(headerCount).join(', ')}`);
+      return cells.slice(0, headerCount);
+    }
+    
+    return cells;
+  });
+  
+  return { headers, rows };
+}
+
+function reconstructCSV(headers: string[], rows: string[][]): string {
+  return [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
+}
+
 @Injectable()
 export class UniAgentService {
-  private readonly model: ChatOllama;
-  private readonly tools: Map<string, Function>;
+  private readonly model: ChatGoogleGenerativeAI;
+  private plannerChain: RunnableSequence;
+  private dataAnalysisChain: RunnableSequence;
   private summaryChain: RunnableSequence;
   private insightsChain: RunnableSequence;
+  private tools: Tool[];
 
   constructor(
     @InjectRepository(KnowledgeBase)
     private readonly knowledgeBaseRepository: Repository<KnowledgeBase>,
   ) {
-    this.model = new ChatOllama({
-      model: 'llama3',
-      baseUrl: 'http://localhost:11434',
-      temperature: 0.2,
+    // Initialize Google Gemini model
+    this.model = new ChatGoogleGenerativeAI({
+      model: 'gemini-2.5-flash',
+      temperature: 0.3,
+      apiKey: process.env.GOOGLE_API_KEY || 'your-api-key-here',
     });
+    console.log('Api key used: ', process.env.GOOGLE_API_KEY);
 
-    this.setupReportChains();
-    this.tools = this.initializeTools();
+    this.setupChains();
+    this.setupTools();
   }
 
-  private setupReportChains() {
+  private setupChains() {
+    // Planner chain for orchestrating tasks
+    const plannerSchema = z.object({
+      tasks: z.array(
+        z.object({
+          agent: z.enum(['data', 'report', 'automation']),
+          action: z.string(),
+          params: z.record(z.any()),
+          dependencies: z.array(z.number()).optional(),
+        })
+      ),
+      reasoning: z.string(),
+    });
+
+    const plannerParser = StructuredOutputParser.fromZodSchema(plannerSchema);
+    const plannerFormatInstructions = plannerParser
+      .getFormatInstructions()
+      .replace(/{/g, '{{')
+      .replace(/}/g, '}}');
+
+    const plannerPromptTemplate = `
+You are a unified agent that can handle data processing, analysis, and report generation.
+
+AVAILABLE CAPABILITIES:
+1. DATA PROCESSING: Clean, transform, validate, and store data
+   - Actions: 
+     * get_by_id: Retrieve a processed record by its ID
+     * get_by_filename: Retrieve a processed record by its filename
+     * process_data: Process raw data (clean, transform, validate) and save to database
+   
+2. REPORT GENERATION: Create comprehensive reports from processed data
+   - Actions: 
+     * generate_report: Generate a comprehensive report with insights and recommendations
+     * create_summary: Create a quick summary of the data
+     * export_pdf: Export report as PDF (HTML)
+     * export_markdown: Export report as Markdown
+     * export_json: Export report as JSON
+     * get_statistics: Get basic statistics about the data
+
+TASK PLANNING RULES:
+- If user mentions an EXISTING file/record in the database, use get_by_filename or get_by_id to RETRIEVE it
+- Only use process_data when user is uploading NEW data or explicitly asks to process/re-process data
+- Reports can be generated directly from existing records using recordId or filename
+- Use dependencies array to specify task order (by index, 0-based)
+- When a task depends on another task's result, use placeholder syntax: {{task.INDEX.FIELD}}
+- Example: If task 0 retrieves data, task 1 can use {{task.0.id}} to reference the record ID
+
+PARAMETER PLACEHOLDER SYNTAX:
+- Use {{task.0.id}} to reference the "id" field from task 0's result
+- Use {{task.0.filename}} to reference the "filename" field from task 0's result
+- Use {{task.1.recordId}} to reference the "recordId" field from task 1's result
+- For export tasks that depend on generate_report, use the SAME parameters as the generate_report task
+
+CRITICAL RULES FOR EXPORT TASKS:
+- export_pdf, export_markdown, export_json should use the SAME parameters as the generate_report task they depend on
+- Do NOT use {{task.X.reportId}} - this field does not exist
+- Use the same recordId, filename, or data parameters that were used in the generate_report task
+
+EXAMPLES:
+- "Create report from employees.csv" → 
+  Task 0: get_by_filename with filename="employees.csv"
+  Task 1: generate_report with recordId="{{task.0.id}}"
+  
+- "Generate report for record abc-123" → 
+  Task 0: get_by_id with id="abc-123"
+  Task 1: generate_report with recordId="{{task.0.id}}"
+  
+- "Process this new data and report" → 
+  Task 0: process_data (data will be auto-injected from context)
+  Task 1: generate_report with recordId="{{task.0.recordId}}"
+
+- "Generate report from employees.csv and export to PDF" →
+  Task 0: get_by_filename with filename="employees.csv"
+  Task 1: generate_report with recordId="{{task.0.id}}"
+  Task 2: export_pdf with recordId="{{task.0.id}}" (SAME as task 1)
+
+USER REQUEST:
+{request}
+
+CONTEXT (if available):
+{context}
+
+Plan the workflow as a sequence of tasks. Use this exact JSON format:
+${plannerFormatInstructions}
+
+Provide your workflow plan:`;
+
+    const plannerPrompt = ChatPromptTemplate.fromTemplate(plannerPromptTemplate);
+    this.plannerChain = RunnableSequence.from([plannerPrompt, this.model, plannerParser]);
+
+    // Data analysis chain
+    const dataAnalysisSchema = z.object({
+      needs_cleaning: z.boolean(),
+      needs_transformation: z.boolean(),
+      needs_validation: z.boolean(),
+      raw_text_allowed: z.boolean().optional(),
+      explanation: z.string(),
+    });
+
+    const dataAnalysisParser = StructuredOutputParser.fromZodSchema(dataAnalysisSchema);
+    const dataAnalysisFormatInstructions = dataAnalysisParser
+      .getFormatInstructions()
+      .replace(/{/g, '{{')
+      .replace(/}/g, '}}');
+
+    const dataAnalysisPromptTemplate = `
+You are a data quality analyst. Analyze the provided data and determine what processing is needed.
+
+DEFINITIONS:
+- needs_cleaning: true if data contains NULL, N/A, empty values, or needs whitespace normalization
+- needs_transformation: true if dates need standardization (to YYYY-MM-DD), emails need lowercase, phone numbers need formatting, or currency has commas
+- needs_validation: true if you need to check for invalid emails (missing @), ages outside 0-120, invalid dates, or amounts outside reasonable ranges
+
+RULES:
+- If the data is NOT tabular/CSV format, set raw_text_allowed=true and all other flags to false
+- If the data IS tabular (has rows and columns), analyze what processing it needs
+- Look for patterns like: NULL values, inconsistent date formats (MM/DD/YYYY vs YYYY-MM-DD), mixed case emails, unformatted phone numbers
+- Check if ages contain text instead of numbers, if emails are missing @, if dates are malformed
+
+Use this exact JSON format:
+${dataAnalysisFormatInstructions}
+
+Data to analyze:
+{data}
+
+Provide your analysis:`;
+
+    const dataAnalysisPrompt = ChatPromptTemplate.fromTemplate(dataAnalysisPromptTemplate);
+    this.dataAnalysisChain = RunnableSequence.from([dataAnalysisPrompt, this.model, dataAnalysisParser]);
+
     // Summary chain
     const summarySchema = z.object({
       summary: z.string(),
@@ -161,288 +372,513 @@ Respond with only the JSON object:`;
     ]);
   }
 
-  private initializeTools(): Map<string, Function> {
-    return new Map([
-      // Data retrieval tools
-      ['get_by_id', this.getRecordById.bind(this)],
-      ['get_by_filename', this.findRecordByFilename.bind(this)],
-      
-      // Data processing tools
-      ['analyze_data', this.analyzeData.bind(this)],
-      ['clean_data', this.cleanData.bind(this)],
-      ['transform_data', this.transformData.bind(this)],
-      ['validate_data', this.validateData.bind(this)],
-      ['deduplicate_data', this.deduplicateData.bind(this)],
-      ['normalize_data', this.normalizeData.bind(this)],
-      
-      // Storage tools
-      ['save_to_database', this.saveToDatabase.bind(this)],
-      
-      // Report generation tools
-      ['generate_report', this.generateReport.bind(this)],
-      ['create_summary', this.createSummary.bind(this)],
-      ['export_pdf', this.exportPdf.bind(this)],
-      ['export_markdown', this.exportMarkdown.bind(this)],
-      ['export_json', this.exportJson.bind(this)],
-      ['get_statistics', this.getDataStatistics.bind(this)],
-      
-      // Workflow tools
-      ['plan_workflow', this.planWorkflow.bind(this)],
-      ['execute_workflow', this.executeWorkflow.bind(this)],
-    ]);
+  private setupTools() {
+    this.tools = [
+      {
+        name: "clean",
+        description: "Removes null values, duplicates, and corrects formatting errors. Handles multiple data separators and replaces empty fields with 'Unknown'.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '';
+          
+          try {
+            const { headers, rows } = parseCSV(data);
+            
+            const cleanedRows = rows.map(row => {
+              return row.map(cell => {
+                // Replace null/empty patterns
+                const nullPatterns = /^(NULL|N\/A|null|na|n\/a|PENDING|TBD|undefined|nil|none|--|)$/gi;
+                if (nullPatterns.test(cell)) {
+                  return 'Unknown';
+                }
+                // Normalize whitespace
+                return cell.replace(/\s+/g, ' ').trim();
+              });
+            });
+            
+            return reconstructCSV(headers, cleanedRows);
+          } catch (e) {
+            console.error('Clean tool CSV parsing failed:', e.message);
+            // Fallback to simple cleaning if CSV parsing fails
+            let cleaned = data;
+            cleaned = cleaned.replace(/\b(NULL|N\/A|null|na|n\/a|PENDING|TBD|undefined|nil|none|--)\b/gi, 'Unknown');
+            cleaned = cleaned.replace(/\s+/g, ' ').trim();
+            return cleaned;
+          }
+        },
+      },
+      {
+        name: "transform",
+        description: "Standardizes date formats (to ISO 8601), phone numbers, emails, currency values, and common data types.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '';
+          
+          try {
+            const { headers, rows } = parseCSV(data);
+            
+            const transformedRows = rows.map(row => {
+              return row.map((cell, idx) => {
+                // Safety check: ensure header exists for this index
+                if (idx >= headers.length) {
+                  console.warn(`Column index ${idx} exceeds header count ${headers.length}`);
+                  return cell;
+                }
+                
+                const header = headers[idx] || '';
+                
+                // Transform dates
+                if (header.includes('date') || /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(cell)) {
+                  // MM/DD/YYYY to YYYY-MM-DD
+                  cell = cell.replace(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/, (match, m, d, y) => {
+                    const month = m.padStart(2, '0');
+                    const day = d.padStart(2, '0');
+                    if (parseInt(month) > 12 || parseInt(day) > 31) return match;
+                    return `${y}-${month}-${day}`;
+                  });
+                  
+                  // DD-MM-YYYY to YYYY-MM-DD
+                  cell = cell.replace(/^(\d{1,2})-(\d{1,2})-(\d{4})$/, (match, d, m, y) => {
+                    const month = m.padStart(2, '0');
+                    const day = d.padStart(2, '0');
+                    if (parseInt(month) > 12 || parseInt(day) > 31) return match;
+                    return `${y}-${month}-${day}`;
+                  });
+                  
+                  // YYYY/MM/DD to YYYY-MM-DD
+                  cell = cell.replace(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/, (match, y, m, d) => {
+                    const month = m.padStart(2, '0');
+                    const day = d.padStart(2, '0');
+                    if (parseInt(month) > 12 || parseInt(day) > 31) return match;
+                    return `${y}-${month}-${day}`;
+                  });
+                }
+                
+                // Transform emails to lowercase
+                if (header.includes('email') || cell.includes('@')) {
+                  const validEmailPattern = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+                  if (validEmailPattern.test(cell)) {
+                    cell = cell.toLowerCase();
+                  }
+                }
+                
+                // Transform phone numbers
+                if (header.includes('phone') || /\d{3}[-.\s]?\d{3}[-.\s]?\d{4}/.test(cell)) {
+                  cell = cell.replace(/\+?1?[-.\s]?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})/, '$1-$2-$3');
+                }
+                
+                // Transform currency - be more specific to avoid breaking CSV structure
+                if (header.includes('salary') || header.includes('price') || header.includes('amount')) {
+                  // Remove commas from currency values (e.g., 75,000 → 75000)
+                  cell = cell.replace(/^(\d{1,3}(?:,\d{3})+)$/, (match) => {
+                    return match.replace(/,/g, '');
+                  });
+                  // Also handle with dollar sign: $75,000 → 75000
+                  cell = cell.replace(/^\$(\d{1,3}(?:,\d{3})+(?:\.\d{2})?)$/, (match, num) => {
+                    return num.replace(/,/g, '');
+                  });
+                }
+                
+                return cell;
+              });
+            });
+            
+            return reconstructCSV(headers, transformedRows);
+          } catch (e) {
+            console.error('Transform tool CSV parsing failed:', e.message);
+            // Fallback to regex-based transformation
+            let transformed = data;
+            transformed = transformed.replace(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/g, (match, m, d, y) => {
+              return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+            });
+            transformed = transformed.replace(/([a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi, (m) => m.toLowerCase());
+            return transformed;
+          }
+        },
+      },
+      {
+        name: "validate",
+        description: "Validates emails, dates, ages, and numeric ranges based on column context. Marks invalid entries with [INVALID_*] tags.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '';
+          
+          try {
+            const { headers, rows } = parseCSV(data);
+            
+            const validatedRows = rows.map(row => {
+              return row.map((cell, idx) => {
+                // Safety check: ensure header exists for this index
+                if (idx >= headers.length) {
+                  console.warn(`Column index ${idx} exceeds header count ${headers.length}`);
+                  return cell;
+                }
+                
+                const header = headers[idx] || '';
+                
+                // Validate email columns - ONLY in email columns
+                if (header === 'email' || header.includes('email')) {
+                  const validEmailPattern = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+                  if (!validEmailPattern.test(cell) && cell.toLowerCase() !== 'unknown') {
+                    return '[INVALID_EMAIL]';
+                  }
+                }
+                
+                // Validate age columns - ONLY in age columns
+                if (header === 'age' || header.includes('age')) {
+                  // Check if it's not a valid number and not 'Unknown'
+                  if (!/^\d+$/.test(cell) && cell.toLowerCase() !== 'unknown') {
+                    return '[INVALID_AGE]';
+                  }
+                  // Check if numeric age is out of range
+                  if (/^\d+$/.test(cell)) {
+                    const age = parseInt(cell);
+                    if (age < 0 || age > 120) {
+                      return '[INVALID_AGE]';
+                    }
+                  }
+                }
+                
+                // Validate date columns - ONLY in date columns
+                if (header === 'date' || header.includes('date')) {
+                  const datePattern = /^(\d{4})-(\d{2})-(\d{2})$/;
+                  const match = cell.match(datePattern);
+                  if (match && cell.toLowerCase() !== 'unknown') {
+                    const [, y, m, d] = match;
+                    const year = parseInt(y);
+                    const month = parseInt(m);
+                    const day = parseInt(d);
+                    
+                    if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1900 || year > 2100) {
+                      return '[INVALID_DATE]';
+                    }
+                    if (month === 2 && day > 29) return '[INVALID_DATE]';
+                    if ([4, 6, 9, 11].includes(month) && day > 30) return '[INVALID_DATE]';
+                  } else if (!match && cell.toLowerCase() !== 'unknown' && /\d/.test(cell)) {
+                    // Date column has data but not in correct format
+                    return '[INVALID_DATE]';
+                  }
+                }
+                
+                // Validate phone columns - ONLY in phone columns
+                if (header === 'phone' || header.includes('phone')) {
+                  const phonePattern = /^(\d{3})-(\d{3})-(\d{4})$/;
+                  const match = cell.match(phonePattern);
+                  if (match) {
+                    const [, area] = match;
+                    if (area[0] === '0' || area[0] === '1') {
+                      return '[INVALID_PHONE]';
+                    }
+                  } else if (cell.toLowerCase() !== 'unknown' && /\d/.test(cell)) {
+                    return '[INVALID_PHONE]';
+                  }
+                }
+                
+                // Validate salary/amount columns - ONLY in these columns
+                if (header === 'salary' || header === 'amount' || header === 'price' || 
+                    header.includes('salary') || header.includes('amount') || header.includes('price')) {
+                  if (/^\d+(\.\d{3})?$/.test(cell)) {
+                    return '[INVALID_AMOUNT]';
+                  }
+                }
+                
+                return cell;
+              });
+            });
+            
+            return reconstructCSV(headers, validatedRows);
+          } catch (e) {
+            console.error('Validate tool CSV parsing failed:', e.message);
+            // If CSV parsing fails, return original data
+            return data;
+          }
+        },
+      },
+      {
+        name: "deduplicate",
+        description: "Removes duplicate rows from the dataset while preserving the header.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '';
+          
+          try {
+            const { headers, rows } = parseCSV(data);
+            
+            const uniqueRows: string[][] = [];
+            const seen = new Set<string>();
+            
+            for (const row of rows) {
+              const rowKey = row.join('|');
+              if (!seen.has(rowKey)) {
+                seen.add(rowKey);
+                uniqueRows.push(row);
+              }
+            }
+            
+            return reconstructCSV(headers, uniqueRows);
+          } catch (e) {
+            console.error('Deduplicate tool CSV parsing failed:', e.message);
+            const lines = data.split('\n');
+            const uniqueLines = [...new Set(lines.map(line => line.trim()))].filter(line => line.length > 0);
+            return uniqueLines.join('\n');
+          }
+        },
+      },
+      {
+        name: "normalize",
+        description: "Normalizes text casing, state codes, and whitespace consistently across all fields.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '';
+          
+          try {
+            const { headers, rows } = parseCSV(data);
+            
+            const normalizedRows = rows.map(row => {
+              return row.map((cell, idx) => {
+                // Safety check: ensure header exists for this index
+                if (idx >= headers.length) {
+                  console.warn(`Column index ${idx} exceeds header count ${headers.length}`);
+                  return cell;
+                }
+                
+                const header = headers[idx] || '';
+                
+                // Normalize name fields to Title Case
+                if (header.includes('name')) {
+                  cell = cell.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+                }
+                
+                // Normalize state codes
+                if (header.includes('state')) {
+                  const states = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'];
+                  if (states.includes(cell.toUpperCase())) {
+                    cell = cell.toUpperCase();
+                  }
+                }
+                
+                return cell.trim();
+              });
+            });
+            
+            return reconstructCSV(headers, normalizedRows);
+          } catch (e) {
+            console.error('Normalize tool CSV parsing failed:', e.message);
+            return data.trim();
+          }
+        },
+      }
+    ];
   }
+
+  private parseJSON(output: AIMessage | string, parser: StructuredOutputParser<any>): any {
+    try {
+      // Extract text content from AIMessage if that's what we received
+      let text: string;
+      if (typeof output === 'string') {
+        text = output;
+      } else if (output instanceof AIMessage || (output && typeof output === 'object' && 'content' in output)) {
+        text = output.content as string;
+      } else {
+        console.error('Unexpected output type:', typeof output, output);
+        text = String(output);
+      }
+
+      // Clean the response - remove markdown code blocks if present
+      let cleaned = text.trim();
+      
+      // Remove markdown code blocks
+      cleaned = cleaned.replace(/```json\s*/g, '');
+      cleaned = cleaned.replace(/```\s*/g, '');
+      
+      // Remove any leading text before the JSON object
+      const jsonStart = cleaned.indexOf('{');
+      const jsonEnd = cleaned.lastIndexOf('}');
+      
+      if (jsonStart !== -1 && jsonEnd !== -1) {
+        cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
+      }
+
+      // Fix common LLM JSON formatting issues
+      cleaned = this.fixMalformedJSON(cleaned);
+      
+      // Try to parse the cleaned JSON
+      const parsed = JSON.parse(cleaned);
+      return parsed;
+    } catch (error) {
+      console.error('Failed to parse LLM response:', output);
+      console.error('Parse error:', error.message);
+      
+      // Try the original parser as fallback
+      try {
+        // Extract content if it's an AIMessage
+        const text = typeof output === 'string' ? output : (output as AIMessage).content as string;
+        return parser.parse(text);
+      } catch (fallbackError) {
+        // Return a default structure if all parsing fails
+        console.error('Fallback parser also failed, returning defaults');
+        return this.getDefaultResponse(output);
+      }
+    }
+  }
+
+  private fixMalformedJSON(jsonStr: string): string {
+    try {
+      // First pass: Fix missing commas between array closing and next property
+      // Pattern: ]<newline>"propertyName": should be ],<newline>"propertyName":
+      jsonStr = jsonStr.replace(/\]\s*\n\s*"/g, '],\n"');
+      
+      // Also fix: }<newline>"propertyName": should be },<newline>"propertyName":
+      jsonStr = jsonStr.replace(/\}\s*\n\s*"/g, '},\n"');
+
+      // Fix missing quotes in array elements
+      // Match array elements that start without quotes after [ or ,
+      jsonStr = jsonStr.replace(/(\[|\,)\s*\n\s*([A-Z][^"\[\]\{\},]*?)\s*(?=,|\])/g, (match, prefix, content) => {
+        // Only fix if it doesn't already start with a quote
+        if (!content.startsWith('"')) {
+          return `${prefix}\n"${content.trim()}"`;
+        }
+        return match;
+      });
+
+      // Fix lines in arrays that don't start or end with quotes
+      // This handles multi-line array elements
+      const lines = jsonStr.split('\n');
+      const fixed: string[] = [];
+      let inArray = false;
+      let arrayDepth = 0;
+
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i];
+        const trimmed = line.trim();
+
+        // Track array depth
+        if (trimmed.includes('[')) {
+          arrayDepth += (trimmed.match(/\[/g) || []).length;
+          inArray = arrayDepth > 0;
+        }
+        if (trimmed.includes(']')) {
+          arrayDepth -= (trimmed.match(/\]/g) || []).length;
+          inArray = arrayDepth > 0;
+        }
+
+        // If we're in an array and the line doesn't start with " or end properly
+        if (inArray && trimmed.length > 0 && 
+            !trimmed.startsWith('"') && 
+            !trimmed.startsWith('[') && 
+            !trimmed.startsWith(']') &&
+            !trimmed.startsWith('{') &&
+            !trimmed.startsWith('}') &&
+            trimmed !== ',' &&
+            !/^\s*"[^"]*"\s*:/.test(trimmed)) { // Not a key-value pair
+          
+          // Check if line ends with comma or array bracket
+          const hasComma = trimmed.endsWith(',');
+          const hasClosingBracket = trimmed.endsWith(']');
+          
+          // Remove trailing comma or bracket temporarily
+          let content = trimmed;
+          if (hasComma) {
+            content = content.slice(0, -1).trim();
+          } else if (hasClosingBracket) {
+            content = content.slice(0, -1).trim();
+          }
+
+          // Add quotes if not present
+          if (!content.startsWith('"')) {
+            content = '"' + content;
+          }
+          if (!content.endsWith('"')) {
+            content = content + '"';
+          }
+
+          // Re-add comma or bracket
+          if (hasComma) {
+            content += ',';
+          } else if (hasClosingBracket) {
+            content += ']';
+          }
+
+          line = line.replace(trimmed, content);
+        }
+
+        fixed.push(line);
+      }
+
+      return fixed.join('\n');
+    } catch (error) {
+      console.error('Error fixing malformed JSON:', error.message);
+      return jsonStr; // Return original if fixing fails
+    }
+  }
+
+  private getDefaultResponse(output: any): any {
+    // Extract whatever we can from the output
+    console.warn('Using fallback default response due to parsing failure');
+    
+    return {
+      insights: ['Unable to parse full insights from LLM response'],
+      trends: ['Data analysis in progress'],
+      anomalies: [],
+      recommendations: ['Review data quality and retry analysis'],
+      summary: 'Analysis could not be completed',
+      key_points: ['Parsing error occurred'],
+      data_quality: 'unknown',
+      record_count: 0,
+    };
+  }
+
+  // ===== ORCHESTRATOR FUNCTIONALITY =====
 
   async processRequest(request: string, context?: any): Promise<any> {
     console.log('=== UNI-AGENT: Processing Request ===');
     console.log('Request:', request);
-    console.log('Context:', context ? Object.keys(context) : 'None');
+    console.log('Context:', JSON.stringify(context, null, 2));
 
-    // Decide if we need workflow planning or can directly execute
-    const needsPlanning = await this.needsWorkflowPlanning(request);
+    const plan = await this.planWorkflow(request, context);
+    console.log('Workflow plan:', JSON.stringify(plan, null, 2));
 
-    if (needsPlanning) {
-      console.log('✓ Request requires workflow planning');
-      const plan = await this.planWorkflow(request, context);
-      return await this.executeWorkflow(plan, context);
-    } else {
-      console.log('✓ Request can be handled directly');
-      return await this.handleDirectRequest(request, context);
-    }
-  }
-
-  private async needsWorkflowPlanning(request: string): Promise<boolean> {
-    // Simple heuristics to determine if we need multi-step planning
-    const multiStepKeywords = [
-      'then', 'after', 'and then', 'followed by',
-      'first', 'second', 'finally',
-      'process and', 'analyze and', 'clean and',
-      'generate report', 'create report', 'export'
-    ];
-
-    return multiStepKeywords.some(keyword => 
-      request.toLowerCase().includes(keyword)
-    );
-  }
-
-  private async handleDirectRequest(request: string, context?: any): Promise<any> {
-    // For simple single-action requests
-    const intent = await this.detectIntent(request);
-    
-    switch (intent) {
-      case 'retrieve':
-        return this.handleRetrieveRequest(request, context);
-      case 'process':
-        return this.handleProcessRequest(request, context);
-      case 'analyze':
-        return this.handleAnalyzeRequest(request, context);
-      case 'report':
-        return this.handleReportRequest(request, context);
-      default:
-        throw new Error(`Unknown intent: ${intent}`);
-    }
-  }
-
-  private async detectIntent(request: string): Promise<string> {
-    const lowerRequest = request.toLowerCase();
-    
-    if (lowerRequest.includes('get') || lowerRequest.includes('retrieve') || lowerRequest.includes('find')) {
-      return 'retrieve';
-    }
-    if (lowerRequest.includes('report') || lowerRequest.includes('summary') || lowerRequest.includes('export')) {
-      return 'report';
-    }
-    if (lowerRequest.includes('process') || lowerRequest.includes('clean') || lowerRequest.includes('transform')) {
-      return 'process';
-    }
-    if (lowerRequest.includes('analyze') || lowerRequest.includes('analysis')) {
-      return 'analyze';
-    }
-    
-    return 'process'; // Default
-  }
-
-  private async handleRetrieveRequest(request: string, context?: any): Promise<any> {
-    // Extract filename or ID from request or context
-    if (context?.filename) {
-      return await this.findRecordByFilename(context.filename);
-    }
-    if (context?.id || context?.recordId) {
-      return await this.getRecordById(context.id || context.recordId);
-    }
-    
-    throw new Error('No filename or ID provided for retrieval');
-  }
-
-  private async handleProcessRequest(request: string, context?: any): Promise<any> {
-    if (!context?.fileData) {
-      throw new Error('No file data provided for processing');
-    }
-
-    const filename = context.filename || 'uploaded_file.csv';
-    const data = context.fileData;
-
-    // Full processing pipeline
-    const analysis = await this.analyzeData(data);
-    let processed = data;
-
-    if (analysis.needs_cleaning) {
-      processed = await this.cleanData(processed);
-    }
-    if (analysis.needs_transformation) {
-      processed = await this.transformData(processed);
-    }
-    if (analysis.needs_validation) {
-      processed = await this.validateData(processed);
-    }
-
-    const saved = await this.saveToDatabase({
-      title: filename,
-      content: processed,
-      tags: context.tags,
-    });
+    const results = await this.executeWorkflow(plan, context);
 
     return {
-      analysis,
-      processedData: processed,
-      recordId: saved.id,
-      message: 'Data processed and saved successfully',
+      plan,
+      results,
+      summary: this.summarizeResults(results),
     };
   }
 
-  private async handleAnalyzeRequest(request: string, context?: any): Promise<any> {
-    if (!context?.fileData) {
-      throw new Error('No file data provided for analysis');
-    }
+  private async planWorkflow(
+    request: string,
+    context?: any
+  ): Promise<WorkflowPlan> {
+    try {
+      const contextStr = context ? JSON.stringify(context) : 'None';
+      const result = await this.plannerChain.invoke({
+        request,
+        context: contextStr,
+      });
 
-    return await this.analyzeData(context.fileData);
+      const tasks: AgentTask[] = result.tasks.map((task: any) => ({
+        agent: task.agent,
+        action: task.action,
+        params: task.params,
+        status: 'pending' as const,
+        dependencies: task.dependencies || [],
+      }));
+
+      return {
+        tasks,
+        reasoning: result.reasoning,
+      };
+    } catch (error) {
+      console.error('Planning error:', error);
+      throw new Error(`Failed to plan workflow: ${error.message}`);
+    }
   }
 
-  private async handleReportRequest(request: string, context?: any): Promise<any> {
-    const lowerRequest = request.toLowerCase();
-    
-    // Determine report type
-    if (lowerRequest.includes('summary')) {
-      return await this.createSummary(context);
-    }
-    if (lowerRequest.includes('statistics') || lowerRequest.includes('stats')) {
-      if (!context?.fileData && !context?.data) {
-        throw new Error('No data provided for statistics');
-      }
-      return await this.getDataStatistics(context.fileData || context.data);
-    }
-    
-    // Default to full report
-    return await this.generateReport(context);
-  }
-
-  private async planWorkflow(request: string, context?: any): Promise<WorkflowPlan> {
-    console.log('=== PLANNING WORKFLOW ===');
-    
-    const outputSchema = z.object({
-      tasks: z.array(
-        z.object({
-          action: z.string(),
-          params: z.record(z.any()),
-          dependencies: z.array(z.number()).optional(),
-        })
-      ),
-      reasoning: z.string(),
-    });
-
-    const parser = StructuredOutputParser.fromZodSchema(outputSchema);
-    const formatInstructions = parser
-      .getFormatInstructions()
-      .replace(/{/g, '{{')
-      .replace(/}/g, '}}');
-
-    const promptTemplate = `
-You are an intelligent agent that plans and executes data processing workflows.
-
-AVAILABLE ACTIONS:
-1. RETRIEVAL:
-   - get_by_id: Retrieve record by ID (params: {id})
-   - get_by_filename: Retrieve record by filename (params: {filename})
-
-2. DATA PROCESSING:
-   - analyze_data: Analyze data quality (params: {data})
-   - clean_data: Remove nulls and format data (params: {data})
-   - transform_data: Standardize formats (params: {data})
-   - validate_data: Validate data integrity (params: {data})
-   - deduplicate_data: Remove duplicates (params: {data})
-   - normalize_data: Normalize text casing (params: {data})
-
-3. STORAGE:
-   - save_to_database: Save processed data (params: {title, content, tags?})
-
-4. REPORTING:
-   - generate_report: Create comprehensive report (params: {recordId?, filename?, data?, reportType?})
-   - create_summary: Create quick summary (params: {recordId?, filename?, data?})
-   - export_pdf: Export report as PDF/HTML (params: {report})
-   - export_markdown: Export report as Markdown (params: {report})
-   - export_json: Export report as JSON (params: {report})
-   - get_statistics: Get basic statistics (params: {data})
-
-PLANNING RULES:
-- If user mentions an EXISTING file/record, start with get_by_filename or get_by_id
-- For NEW file uploads, use processing actions (analyze_data → clean_data → etc.)
-- Reports can reference recordId, filename, or work directly with data
-- Use dependencies array to specify execution order (0-based indices)
-- Use {{task.INDEX.FIELD}} syntax to reference previous task results
-- For "process and report" workflows: process_data → save_to_database → generate_report
-- For "export report" workflows: generate_report → export_pdf/markdown/json
-
-EXAMPLES:
-1. "Process this CSV and generate a report"
-   → analyze_data → clean_data → transform_data → save_to_database → generate_report
-
-2. "Create a report for employees.csv and export as PDF"
-   → get_by_filename → generate_report → export_pdf
-
-3. "Get statistics for the uploaded data"
-   → get_statistics
-
-4. "Clean the data, save it, and create a summary"
-   → clean_data → save_to_database → create_summary
-
-USER REQUEST: {request}
-
-CONTEXT: {context}
-
-Plan the workflow using this JSON format:
-${formatInstructions}`;
-
-    const prompt = ChatPromptTemplate.fromTemplate(promptTemplate);
-    const chain = RunnableSequence.from([prompt, this.model, parser]);
-
-    const result = await chain.invoke({
-      request,
-      context: context ? JSON.stringify(context, null, 2) : 'None',
-    });
-
-    const tasks: Task[] = result.tasks.map((task: any) => ({
-      action: task.action,
-      params: task.params,
-      status: 'pending' as const,
-      dependencies: task.dependencies || [],
-    }));
-
-    return {
-      tasks,
-      reasoning: result.reasoning,
-    };
-  }
-
-  private async executeWorkflow(plan: WorkflowPlan, context?: any): Promise<any> {
-    console.log('=== EXECUTING WORKFLOW ===');
-    console.log('Plan:', JSON.stringify(plan, null, 2));
-
+  private async executeWorkflow(plan: WorkflowPlan, context?: any): Promise<any[]> {
+    console.log('=== UNI-AGENT: Executing Workflow ===');
     const results: any[] = [];
 
     for (let i = 0; i < plan.tasks.length; i++) {
       const task = plan.tasks[i];
-      console.log(`\nExecuting task ${i + 1}/${plan.tasks.length}: ${task.action}`);
+      console.log(`\nExecuting task ${i + 1}/${plan.tasks.length}:`, task.action);
 
-      // Check dependencies
       const deps = (task as any).dependencies || [];
       for (const depIdx of deps) {
         if (results[depIdx]?.error) {
@@ -456,279 +892,469 @@ ${formatInstructions}`;
       task.status = 'running';
 
       try {
-        // Resolve parameters with context and previous results
-        const resolvedParams = this.resolveParams(task.params, results, context);
-        
-        // Execute the task
-        const tool = this.tools.get(task.action);
-        if (!tool) {
-          throw new Error(`Unknown action: ${task.action}`);
-        }
-
-        const result = await tool(resolvedParams);
+        const result = await this.executeTask(task, results, context);
         task.status = 'completed';
         task.result = result;
         results.push(result);
-        
-        console.log(`✓ Task ${i + 1} completed successfully`);
+        console.log(`Task ${i + 1} completed successfully`);
       } catch (error) {
         task.status = 'failed';
         task.error = error.message;
         results.push({ error: error.message });
-        console.error(`✗ Task ${i + 1} failed:`, error.message);
+        console.error(`Task ${i + 1} failed:`, error.message);
         
-        // Stop workflow on critical failures
-        throw new Error(`Workflow failed at task ${i + 1}: ${error.message}`);
-      }
-    }
-
-    return {
-      plan,
-      results,
-      summary: this.summarizeResults(results),
-    };
-  }
-
-  private resolveParams(params: any, previousResults: any[], context?: any): any {
-    const resolved = { ...params };
-
-    // First, resolve task dependencies
-    for (const [key, value] of Object.entries(resolved)) {
-      if (typeof value === 'string') {
-        const match = value.match(/\{\{task\.(\d+)\.(\w+)\}\}/);
-        if (match) {
-          const [, taskIdx, field] = match;
-          const taskResult = previousResults[parseInt(taskIdx)];
-          if (taskResult && taskResult[field] !== undefined) {
-            resolved[key] = taskResult[field];
-          }
+        if (task.agent === 'data') {
+          throw new Error(`Critical task failed: ${error.message}`);
         }
       }
     }
 
-    // Then, inject context values
+    return results;
+  }
+
+  private async executeTask(task: AgentTask, previousResults: any[], context?: any): Promise<any> {
+    console.log('\n--- Executing Task ---');
+    console.log('Original params:', JSON.stringify(task.params, null, 2));
+    console.log('Context available:', !!context);
+    
+    // First resolve task dependencies
+    let params = this.enrichParams(task.params, previousResults);
+    console.log('After task dependency resolution:', JSON.stringify(params, null, 2));
+    
+    // Handle export tasks that need to inherit parameters from generate_report tasks
+    if (this.isExportTask(task.action) && this.hasUnresolvedParams(params)) {
+      params = this.inheritParamsFromGenerateReport(task, previousResults, params);
+      console.log('After parameter inheritance:', JSON.stringify(params, null, 2));
+    }
+    
+    // Then inject context values
     if (context) {
-      if (context.fileData && !resolved.data && !resolved.fileData) {
-        resolved.data = context.fileData;
-      }
-      if (context.filename && !resolved.filename && !resolved.title) {
-        resolved.filename = context.filename;
-        resolved.title = context.filename;
-      }
-      if (context.tags && !resolved.tags) {
-        resolved.tags = context.tags;
-      }
-      if (context.recordId && !resolved.recordId) {
-        resolved.recordId = context.recordId;
-      }
+      params = this.injectContextIntoParams(params, context);
+      console.log('After context injection:', JSON.stringify(params, null, 2));
     }
 
-    return resolved;
+    switch (task.agent) {
+      case 'data':
+        return this.executeDataTask(task.action, params);
+      
+      case 'report':
+        return this.executeReportTask(task.action, params);
+      
+      case 'automation':
+        return this.executeAutomationTask(task.action, params);
+      
+      default:
+        throw new Error(`Unknown agent: ${task.agent}`);
+    }
+  }
+
+  private isExportTask(action: string): boolean {
+    return ['export_pdf', 'export_markdown', 'export_json'].includes(action);
+  }
+
+  private hasUnresolvedParams(params: any): boolean {
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === 'string' && value.includes('{task.')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private inheritParamsFromGenerateReport(task: AgentTask, previousResults: any[], currentParams: any): any {
+    console.log('🔧 Attempting parameter inheritance for export task...');
+    
+    // Find the most recent generate_report task in the dependency chain
+    const generateReportResult = this.findGenerateReportResult(task, previousResults);
+    
+    if (generateReportResult) {
+      console.log('✓ Found generate_report result, inheriting parameters...');
+      // The generate_report task should have the same parameters we need for export
+      // We'll use the same recordId, filename, or data that was used to generate the report
+      return {
+        ...currentParams,
+        // Remove any unresolved task references and use the same parameters as the generate_report task
+        recordId: generateReportResult.recordId || currentParams.recordId,
+        filename: generateReportResult.filename || currentParams.filename,
+        data: generateReportResult.data || currentParams.data,
+        reportType: generateReportResult.reportType || currentParams.reportType,
+      };
+    }
+    
+    console.warn('⚠️ No generate_report result found for parameter inheritance');
+    return currentParams;
+  }
+
+  private findGenerateReportResult(task: AgentTask, previousResults: any[]): any {
+    // Look for generate_report results in the dependency chain
+    const dependencies = (task as any).dependencies || [];
+    
+    for (const depIdx of dependencies) {
+      const depResult = previousResults[depIdx];
+      if (depResult && (depResult.metadata || depResult.sections)) {
+        // This looks like a report result
+        return depResult;
+      }
+    }
+    
+    // If no direct dependency, look for any generate_report result
+    for (let i = previousResults.length - 1; i >= 0; i--) {
+      const result = previousResults[i];
+      if (result && (result.metadata || result.sections)) {
+        return result;
+      }
+    }
+    
+    return null;
+  }
+
+  private enrichParams(params: any, previousResults: any[]): any {
+    const enriched = { ...params };
+    
+    for (const [key, value] of Object.entries(enriched)) {
+      if (typeof value === 'string') {
+        // Match single braces {task.0.field}, double braces {{task.0.field}}, or ${task.0.field}
+        const match = value.match(/\{?\{?task\.(\d+)\.(\w+)\}?\}?/);
+        if (match && match[0].includes('task.')) {
+          const [fullMatch, taskIdx, field] = match;
+          const taskResult = previousResults[parseInt(taskIdx)];
+          if (taskResult && taskResult[field] !== undefined) {
+            console.log(`✓ Replacing ${fullMatch} with result from task ${taskIdx}.${field} = ${taskResult[field]}`);
+            enriched[key] = taskResult[field];
+          } else {
+            console.warn(`✗ Could not resolve ${fullMatch}: task result not found or field missing`);
+            console.warn(`  Available fields in task ${taskIdx} result:`, taskResult ? Object.keys(taskResult) : 'no result');
+            
+            // Special handling for export tasks that might need to inherit parameters from generate_report tasks
+            if (field === 'reportId' || field === 'report') {
+              console.warn(`  Note: ${field} field does not exist. Export tasks should use the same parameters as the generate_report task.`);
+            }
+          }
+        }
+      }
+    }
+    
+    return enriched;
+  }
+
+  private injectContextIntoParams(params: any, context: any): any {
+    const enriched = { ...params };
+    
+    console.log('Injecting context into params...');
+    console.log('Available context keys:', Object.keys(context));
+    
+    // Resolve context placeholders in param values
+    for (const [key, value] of Object.entries(enriched)) {
+      if (typeof value === 'string') {
+        // Match both {{context.field}} and ${context.field} patterns
+        const match = value.match(/(?:\{\{|\$\{)context\.(\w+)\}\}/);
+        if (match) {
+          const [fullMatch, field] = match;
+          if (context[field] !== undefined) {
+            console.log(`✓ Replacing ${fullMatch} with context.${field}`);
+            enriched[key] = context[field];
+          } else {
+            console.warn(`✗ Context field "${field}" not found in context`);
+          }
+        }
+      }
+    }
+    
+    // Auto-inject common context fields if not already present
+    if (context.fileData && !enriched.fileData && !enriched.data) {
+      console.log('✓ Auto-injecting fileData from context');
+      enriched.fileData = context.fileData;
+    }
+    
+    if (context.filename && !enriched.filename) {
+      console.log('✓ Auto-injecting filename from context');
+      enriched.filename = context.filename;
+    }
+    
+    if (context.recordId && !enriched.recordId) {
+      console.log('✓ Auto-injecting recordId from context');
+      enriched.recordId = context.recordId;
+    }
+    
+    return enriched;
+  }
+
+  private async executeDataTask(action: string, params: any): Promise<any> {
+    console.log('Executing DATA task:', action);
+    console.log('Final params:', JSON.stringify(params, null, 2));
+    
+    switch (action) {
+      case 'analyze_data':
+        return this.analyzeData(params.data);
+      
+      case 'get_by_id':
+        if (!params.id) {
+          throw new Error('Missing required parameter: id');
+        }
+        return this.getRecordById(params.id);
+      
+      case 'get_by_filename':
+        if (!params.filename) {
+          throw new Error('Missing required parameter: filename');
+        }
+        return this.findRecordByFilename(params.filename);
+      
+      case 'process_data':
+      case 'upload_and_process':
+        const data = params.fileData || params.data;
+        const filename = params.filename || 'uploaded_file.csv';
+        const tags = params.tags;
+        
+        if (!data) {
+          throw new Error('No data provided for processing. Ensure fileData or data is in params.');
+        }
+        
+        console.log('Processing data:');
+        console.log('  - filename:', filename);
+        console.log('  - data length:', data.length);
+        console.log('  - tags:', tags);
+        
+        return this.analyzeAndProcess(data, filename, tags);
+      
+      default:
+        throw new Error(`Unknown data task: ${action}`);
+    }
+  }
+
+  private async executeReportTask(action: string, params: any): Promise<any> {
+    console.log('Executing REPORT task:', action);
+    console.log('Final params:', JSON.stringify(params, null, 2));
+    
+    switch (action) {
+      case 'generate_report':
+        if (!params.recordId && !params.filename && !params.data) {
+          throw new Error('Missing required parameter: recordId, filename, or data');
+        }
+        return this.generateReport({
+          recordId: params.recordId,
+          filename: params.filename,
+          data: params.data,
+          reportType: params.reportType || 'standard',
+        });
+      
+      case 'create_summary':
+        if (!params.recordId && !params.filename && !params.data) {
+          throw new Error('Missing required parameter: recordId, filename, or data');
+        }
+        return this.createSummary({
+          recordId: params.recordId,
+          filename: params.filename,
+          data: params.data,
+        });
+      
+      case 'export_pdf':
+        const pdfReport = await this.generateReport({
+          recordId: params.recordId,
+          filename: params.filename,
+          data: params.data,
+          reportType: params.reportType,
+        });
+        return this.exportPdf(pdfReport);
+      
+      case 'export_markdown':
+        const mdReport = await this.generateReport({
+          recordId: params.recordId,
+          filename: params.filename,
+          data: params.data,
+          reportType: params.reportType,
+        });
+        return this.formatReportAsMarkdown(mdReport);
+      
+      case 'export_json':
+        const jsonReport = await this.generateReport({
+          recordId: params.recordId,
+          filename: params.filename,
+          data: params.data,
+          reportType: params.reportType,
+        });
+        return this.formatReportAsJson(jsonReport);
+      
+      case 'get_statistics':
+        if (!params.data) {
+          throw new Error('Missing required parameter: data');
+        }
+        return this.getDataStatistics(params.data);
+      
+      default:
+        throw new Error(`Unknown report task: ${action}`);
+    }
+  }
+
+  private async executeAutomationTask(action: string, params: any): Promise<any> {
+    console.log('Executing AUTOMATION task:', action, params);
+    
+    // Placeholder - implement when AutomationAgentService is ready
+    return {
+      message: `Automation task '${action}' executed (placeholder)`,
+      params,
+    };
   }
 
   private summarizeResults(results: any[]): string {
     const successful = results.filter(r => !r.error).length;
     const failed = results.filter(r => r.error).length;
-    return `Workflow completed: ${successful} successful, ${failed} failed`;
+    
+    return `Workflow completed: ${successful} tasks successful, ${failed} tasks failed`;
   }
 
-  // ==================== DATA TOOLS ====================
+  async processAndReport(filename: string, recipientEmail: string): Promise<any> {
+    const request = `
+      1. Get the processed data file named "${filename}"
+      2. Generate a comprehensive report from this data with insights and recommendations
+      3. Send the report to ${recipientEmail}
+    `;
+    
+    return this.processRequest(request, { filename, recipientEmail });
+  }
 
-  private async findRecordByFilename(params: { filename: string } | string) {
-    const filename = (typeof params === 'string' ? params : params.filename).replace(/\.[^/.]+$/, '');
+  async processFileUpload(file: Express.Multer.File, request: string, userContext?: any): Promise<any> {
+    console.log('=== UNI-AGENT: Processing File Upload ===');
+    console.log('Filename:', file.originalname);
+    console.log('File size:', file.size);
+    console.log('Request:', request);
+    if (userContext) {
+      console.log('User Context:', JSON.stringify(userContext, null, 2));
+    }
+
+    const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
+    let text = '';
+
+    try {
+      if (ext === 'csv' || ext === 'txt') {
+        text = file.buffer.toString('utf8');
+      } else if (ext === 'pdf') {
+        const pdfExtractText = require('pdf-parse');
+        const pdfData = await pdfExtractText(file.buffer);
+        text = pdfData.text;
+      } else {
+        text = file.buffer.toString('utf8');
+      }
+    } catch (error) {
+      throw new Error(`Failed to extract text from file: ${error.message}`);
+    }
+
+    if (!text || text.trim().length === 0) {
+      throw new Error('File appears to be empty or could not be read');
+    }
+
+    console.log('Extracted text length:', text.length);
+    console.log('First 100 chars:', text.substring(0, 100));
+
+    const context = {
+      filename: file.originalname,
+      fileSize: file.size,
+      fileType: ext,
+      fileData: text,
+    };
+
+    const enhancedRequest = `
+      A file named "${file.originalname}" has been uploaded and extracted.
+      Task: ${request}
+      
+      The file data is available in the context and ready to be processed and saved to the database.
+    `;
+
+    return this.processRequest(enhancedRequest, context);
+  }
+
+  // ===== DATA AGENT FUNCTIONALITY =====
+
+  async findRecordByFilename(filename: string) {
+    filename = filename.replace(/\.[^/.]+$/, ""); // Remove extension if present
     const record = await this.knowledgeBaseRepository.findOne({
       where: { title: filename },
     });
 
     if (!record) {
-      throw new NotFoundException(`Record "${filename}" not found`);
+      throw new NotFoundException(`Record with filename "${filename}" not found`);
     }
 
     return record;
   }
 
-  private async getRecordById(params: { id: string } | string) {
-    const id = typeof params === 'string' ? params : params.id;
+  async getRecordById(id: string) {
     const record = await this.knowledgeBaseRepository.findOne({
       where: { id },
     });
 
     if (!record) {
-      throw new NotFoundException(`Record ${id} not found`);
+      throw new NotFoundException(`Record with id ${id} not found`);
     }
 
     return record;
   }
 
-  private async analyzeData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
+  async analyzeData(data: string) {
+    try {
+      const result = await this.dataAnalysisChain.invoke({ data });
+      console.log('Analysis result:', JSON.stringify(result, null, 2));
+      return result;
+    } catch (error) {
+      console.error('Analysis error:', error);
+      return { error: "Failed to parse model output", details: error.message };
+    }
+  }
+
+  async executeActions(data: string, analysis: any) {
+    console.log('Executing actions with analysis:', analysis);
+    let result = data;
     
-    const outputSchema = z.object({
-      needs_cleaning: z.boolean(),
-      needs_transformation: z.boolean(),
-      needs_validation: z.boolean(),
-      raw_text_allowed: z.boolean().optional(),
-      explanation: z.string(),
+    // Execute in proper order: clean → transform → validate
+    if (analysis.needs_cleaning) {
+      console.log('Running clean tool...');
+      result = this.tools.find((t) => t.name === "clean")!.call(result);
+      console.log('After cleaning:', result.substring(0, 200));
+    }
+    
+    if (analysis.needs_transformation) {
+      console.log('Running transform tool...');
+      result = this.tools.find((t) => t.name === "transform")!.call(result);
+      console.log('After transformation:', result.substring(0, 200));
+    }
+    
+    if (analysis.needs_validation) {
+      console.log('Running validate tool...');
+      result = this.tools.find((t) => t.name === "validate")!.call(result);
+      console.log('After validation:', result.substring(0, 200));
+    }
+    
+    return result;
+  }
+
+  async analyzeAndProcess(
+    data: string,
+    fileName: string,
+    tags?: string
+  ) {
+    console.log('Starting analyzeAndProcess with data length:', data.length);
+    console.log('First 200 chars:', data.substring(0, 200));
+    
+    const analysis = await this.analyzeData(data);
+    const processedData = await this.executeActions(data, analysis);
+
+    const saved = await this.saveProcessedFile({
+      title: fileName,
+      content: processedData,
+      tags,
     });
 
-    const parser = StructuredOutputParser.fromZodSchema(outputSchema);
-    const formatInstructions = parser.getFormatInstructions()
-      .replace(/{/g, '{{')
-      .replace(/}/g, '}}');
-
-    const promptTemplate = `
-You are a data quality analyst. Analyze the data and determine processing needs.
-
-RULES:
-- needs_cleaning: true if NULL, N/A, empty values, or whitespace issues exist
-- needs_transformation: true if dates, emails, phones, or currency need standardization
-- needs_validation: true if data integrity checks are needed (invalid emails, ages, dates)
-- raw_text_allowed: true if data is NOT tabular/CSV format
-
-Use this JSON format:
-${formatInstructions}
-
-Data to analyze:
-{data}`;
-
-    const prompt = ChatPromptTemplate.fromTemplate(promptTemplate);
-    const chain = RunnableSequence.from([prompt, this.model, parser]);
-
-    return await chain.invoke({ data });
+    return {
+      analysis,
+      processedData,
+      recordId: saved.id,
+    };
   }
 
-  private async cleanData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
-    const { headers, rows } = this.parseCSV(data);
-    
-    const cleanedRows = rows.map(row =>
-      row.map(cell => {
-        const nullPatterns = /^(NULL|N\/A|null|na|PENDING|TBD|undefined|nil|none|--|)$/gi;
-        if (nullPatterns.test(cell)) return 'Unknown';
-        return cell.replace(/\s+/g, ' ').trim();
-      })
-    );
-    
-    return this.reconstructCSV(headers, cleanedRows);
-  }
-
-  private async transformData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
-    const { headers, rows } = this.parseCSV(data);
-    
-    const transformedRows = rows.map(row =>
-      row.map((cell, idx) => {
-        const header = headers[idx] || '';
-        
-        // Transform dates to YYYY-MM-DD
-        if (header.includes('date')) {
-          cell = cell.replace(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/, (_, m, d, y) =>
-            `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
-          );
-        }
-        
-        // Transform emails to lowercase
-        if (header.includes('email') && cell.includes('@')) {
-          cell = cell.toLowerCase();
-        }
-        
-        // Transform phone numbers
-        if (header.includes('phone')) {
-          cell = cell.replace(/\+?1?[-.\s]?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})/, '$1-$2-$3');
-        }
-        
-        // Transform currency
-        if (header.includes('salary') || header.includes('amount')) {
-          cell = cell.replace(/^\$?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?)$/, (_, num) => num.replace(/,/g, ''));
-        }
-        
-        return cell;
-      })
-    );
-    
-    return this.reconstructCSV(headers, transformedRows);
-  }
-
-  private async validateData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
-    const { headers, rows } = this.parseCSV(data);
-    
-    const validatedRows = rows.map(row =>
-      row.map((cell, idx) => {
-        const header = headers[idx] || '';
-        
-        if (header.includes('email')) {
-          const validEmail = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-          if (!validEmail.test(cell) && cell.toLowerCase() !== 'unknown') {
-            return '[INVALID_EMAIL]';
-          }
-        }
-        
-        if (header.includes('age')) {
-          if (!/^\d+$/.test(cell) && cell.toLowerCase() !== 'unknown') {
-            return '[INVALID_AGE]';
-          }
-          if (/^\d+$/.test(cell)) {
-            const age = parseInt(cell);
-            if (age < 0 || age > 120) return '[INVALID_AGE]';
-          }
-        }
-
-        if (header.includes('salary')){
-          if (!/^\d+(\.\d{2})?$/.test(cell) && cell.toLowerCase() !== 'unknown') {
-            return '[INVALID_SALARY]';
-          }
-        }
-        
-        return cell;
-      })
-    );
-    
-    return this.reconstructCSV(headers, validatedRows);
-  }
-
-  private async deduplicateData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
-    const { headers, rows } = this.parseCSV(data);
-    
-    const seen = new Set<string>();
-    const uniqueRows = rows.filter(row => {
-      const key = row.join('|');
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    
-    return this.reconstructCSV(headers, uniqueRows);
-  }
-
-  private async normalizeData(params: { data: string } | string) {
-    const data = typeof params === 'string' ? params : params.data;
-    const { headers, rows } = this.parseCSV(data);
-    
-    const normalizedRows = rows.map(row =>
-      row.map((cell, idx) => {
-        const header = headers[idx] || '';
-        
-        if (header.includes('name')) {
-          cell = cell.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
-        }
-        
-        if (header.includes('state')) {
-          const states = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'];
-          if (states.includes(cell.toUpperCase())) {
-            cell = cell.toUpperCase();
-          }
-        }
-        
-        return cell.trim();
-      })
-    );
-    
-    return this.reconstructCSV(headers, normalizedRows);
-  }
-
-  private async saveToDatabase(params: { title: string; content: string; tags?: string }) {
+  async saveProcessedFile(params: {
+    title: string;
+    content: string;
+    tags?: string;
+  }) {
     const parts = params.title.split('.');
     const extension = parts.length > 1 ? parts.pop()?.toLowerCase() : 'unknown';
     const titleWithoutExt = parts.join('.');
@@ -737,24 +1363,25 @@ Data to analyze:
       title: titleWithoutExt,
       content: params.content,
       raw_content: params.content,
-      analysis_summary: 'Processed by uni-agent',
+      analysis_summary: 'No summary yet',
       filename: params.title,
       file_type: extension,
       tags: params.tags,
     });
 
-    return await this.knowledgeBaseRepository.save(entity);
+    const saved = await this.knowledgeBaseRepository.save(entity);
+    return saved;
   }
 
-  // ==================== REPORT TOOLS ====================
+  // ===== REPORT AGENT FUNCTIONALITY =====
 
-  private async generateReport(params: {
+  async generateReport(params: {
     recordId?: string;
     filename?: string;
     data?: string;
     reportType?: string;
-  } | any): Promise<GeneratedReport> {
-    console.log('=== GENERATING REPORT ===');
+  }): Promise<GeneratedReport> {
+    console.log('=== UNI-AGENT: Generating Report ===');
     console.log('Params:', params);
 
     // Get data from various sources
@@ -775,9 +1402,8 @@ Data to analyze:
       data = record.content;
       sourceInfo = record.filename || record.title;
     } else if (params.filename) {
-      const filename = params.filename.replace(/\.[^/.]+$/, '');
       const record = await this.knowledgeBaseRepository.findOne({
-        where: { title: filename },
+        where: { title: params.filename },
       });
       if (!record) {
         throw new NotFoundException(`Record with filename ${params.filename} not found`);
@@ -788,17 +1414,17 @@ Data to analyze:
       throw new Error('Must provide either recordId, filename, or data');
     }
 
-    // Count records
+    // Count records (assume CSV format)
     const lines = data.split('\n').filter(line => line.trim().length > 0);
-    recordCount = Math.max(0, lines.length - 1);
+    recordCount = Math.max(0, lines.length - 1); // Subtract header
 
-    // Truncate data if too large
+    // Truncate data if too large for LLM context
     const maxDataLength = 8000;
     let truncatedData = data;
     let wasTruncated = false;
     
     if (data.length > maxDataLength) {
-      console.warn(`Data too large (${data.length} chars), truncating to ${maxDataLength}`);
+      console.warn(`Data too large (${data.length} chars), truncating to ${maxDataLength} chars`);
       truncatedData = data.substring(0, maxDataLength) + '\n...[data truncated]...';
       wasTruncated = true;
     }
@@ -807,6 +1433,7 @@ Data to analyze:
       // Generate summary
       console.log('Generating summary...');
       const summaryResult = await this.summaryChain.invoke({ data: truncatedData });
+      console.log('Summary generated:', JSON.stringify(summaryResult, null, 2));
 
       // Generate insights
       console.log('Generating insights...');
@@ -814,8 +1441,9 @@ Data to analyze:
         data: truncatedData,
         summary: summaryResult.summary || '',
       });
+      console.log('Insights generated:', JSON.stringify(insightsResult, null, 2));
 
-      // Build report sections
+      // Build report sections with defensive checks
       const sections: ReportSection[] = [
         {
           title: 'Executive Summary',
@@ -836,7 +1464,7 @@ Data to analyze:
       if (Array.isArray(insightsResult.trends) && insightsResult.trends.length > 0) {
         sections.push({
           title: 'Trends and Patterns',
-          content: 'The following trends were identified:',
+          content: 'The following trends were identified in the data:',
           insights: insightsResult.trends,
         });
       }
@@ -852,10 +1480,11 @@ Data to analyze:
       if (wasTruncated) {
         sections.push({
           title: 'Note',
-          content: 'This analysis was performed on a sample of the data due to size constraints.',
+          content: 'This analysis was performed on a sample of the data due to size constraints. For complete analysis, consider processing smaller data segments.',
         });
       }
 
+      // Build metadata
       const metadata: ReportMetadata = {
         title: `Data Analysis Report - ${sourceInfo}`,
         generatedAt: new Date(),
@@ -875,6 +1504,9 @@ Data to analyze:
       return report;
     } catch (error) {
       console.error('Error generating report:', error);
+      console.error('Error stack:', error.stack);
+      
+      // Return a basic report with error information
       return this.generateFallbackReport(sourceInfo, recordCount, error.message);
     }
   }
@@ -897,29 +1529,31 @@ Data to analyze:
       sections: [
         {
           title: 'Report Generation Error',
-          content: 'An error occurred while generating the detailed analysis.',
+          content: 'An error occurred while generating the detailed analysis. Please review the data and try again.',
         },
         {
           title: 'Basic Information',
           content: `The dataset contains ${recordCount} records from ${sourceInfo}.`,
         },
       ],
-      summary: `Basic report for ${sourceInfo} with ${recordCount} records.`,
+      summary: `Basic report for ${sourceInfo} with ${recordCount} records. Detailed analysis could not be completed.`,
       recommendations: [
         'Check data format and quality',
-        'Ensure Ollama service is running',
+        'Ensure Google Gemini API key is configured',
         'Try with a smaller dataset',
+        'Review error logs for details',
       ],
     };
   }
 
-  private async createSummary(params: {
+  async createSummary(params: {
     recordId?: string;
     filename?: string;
     data?: string;
-  } | any): Promise<any> {
-    console.log('=== CREATING SUMMARY ===');
+  }): Promise<any> {
+    console.log('=== UNI-AGENT: Creating Summary ===');
 
+    // Get data
     let data: string;
 
     if (params.data) {
@@ -933,9 +1567,8 @@ Data to analyze:
       }
       data = record.content;
     } else if (params.filename) {
-      const filename = params.filename.replace(/\.[^/.]+$/, '');
       const record = await this.knowledgeBaseRepository.findOne({
-        where: { title: filename },
+        where: { title: params.filename },
       });
       if (!record) {
         throw new NotFoundException(`Record with filename ${params.filename} not found`);
@@ -945,92 +1578,23 @@ Data to analyze:
       throw new Error('Must provide either recordId, filename, or data');
     }
 
+    // Generate summary
     const summaryResult = await this.summaryChain.invoke({ data });
     return summaryResult;
   }
 
-  private async exportPdf(params: { report?: GeneratedReport } | GeneratedReport | any): Promise<string> {
-    console.log('=== EXPORTING PDF ===');
-    
-    let report: GeneratedReport;
-    
-    // Handle different parameter formats
-    if (params.report) {
-      report = params.report;
-    } else if (params.metadata && params.sections) {
-      report = params as GeneratedReport;
-    } else {
-      throw new Error('Invalid report format for PDF export');
-    }
+  async exportPdf(report: GeneratedReport): Promise<string> {
+    console.log('=== UNI-AGENT: Exporting PDF ===');
 
+    // Generate HTML content for PDF
     const html = this.generateReportHtml(report);
-    console.log('PDF/HTML export generated');
-    
+
+    // In a real implementation, you would use a library like puppeteer or pdfkit
+    // For now, we'll return the HTML as a placeholder
+    console.log('PDF export would be generated here');
+    console.log('Report title:', report.metadata.title);
+
     return html;
-  }
-
-  private async exportMarkdown(params: { report?: GeneratedReport } | GeneratedReport | any): Promise<string> {
-    console.log('=== EXPORTING MARKDOWN ===');
-    
-    let report: GeneratedReport;
-    
-    if (params.report) {
-      report = params.report;
-    } else if (params.metadata && params.sections) {
-      report = params as GeneratedReport;
-    } else {
-      throw new Error('Invalid report format for Markdown export');
-    }
-
-    let markdown = `# ${report.metadata.title}\n\n`;
-    markdown += `**Generated:** ${report.metadata.generatedAt.toLocaleString()}\n`;
-    markdown += `**Data Source:** ${report.metadata.dataSource}\n`;
-    markdown += `**Record Count:** ${report.metadata.recordCount}\n`;
-    markdown += `**Report Type:** ${report.metadata.reportType}\n\n`;
-    markdown += `---\n\n`;
-
-    for (const section of report.sections) {
-      markdown += `## ${section.title}\n\n`;
-      markdown += `${section.content}\n\n`;
-
-      if (section.insights && section.insights.length > 0) {
-        section.insights.forEach(insight => {
-          markdown += `- ${insight}\n`;
-        });
-        markdown += '\n';
-      }
-    }
-
-    if (report.recommendations && report.recommendations.length > 0) {
-      markdown += `## Recommendations\n\n`;
-      report.recommendations.forEach(rec => {
-        markdown += `- ${rec}\n`;
-      });
-      markdown += '\n';
-    }
-
-    return markdown;
-  }
-
-  private async exportJson(params: { report?: GeneratedReport } | GeneratedReport | any): Promise<any> {
-    console.log('=== EXPORTING JSON ===');
-    
-    let report: GeneratedReport;
-    
-    if (params.report) {
-      report = params.report;
-    } else if (params.metadata && params.sections) {
-      report = params as GeneratedReport;
-    } else {
-      throw new Error('Invalid report format for JSON export');
-    }
-
-    return {
-      metadata: report.metadata,
-      sections: report.sections,
-      summary: report.summary,
-      recommendations: report.recommendations,
-    };
   }
 
   private generateReportHtml(report: GeneratedReport): string {
@@ -1122,13 +1686,53 @@ Data to analyze:
     `;
   }
 
-  private async getDataStatistics(params: { data: string } | string): Promise<any> {
-    const data = typeof params === 'string' ? params : params.data;
-    
+  async formatReportAsMarkdown(report: GeneratedReport): Promise<string> {
+    let markdown = `# ${report.metadata.title}\n\n`;
+    markdown += `**Generated:** ${report.metadata.generatedAt.toLocaleString()}\n`;
+    markdown += `**Data Source:** ${report.metadata.dataSource}\n`;
+    markdown += `**Record Count:** ${report.metadata.recordCount}\n`;
+    markdown += `**Report Type:** ${report.metadata.reportType}\n\n`;
+    markdown += `---\n\n`;
+
+    for (const section of report.sections) {
+      markdown += `## ${section.title}\n\n`;
+      markdown += `${section.content}\n\n`;
+
+      if (section.insights && section.insights.length > 0) {
+        section.insights.forEach(insight => {
+          markdown += `- ${insight}\n`;
+        });
+        markdown += '\n';
+      }
+    }
+
+    if (report.recommendations && report.recommendations.length > 0) {
+      markdown += `## Recommendations\n\n`;
+      report.recommendations.forEach(rec => {
+        markdown += `- ${rec}\n`;
+      });
+      markdown += '\n';
+    }
+
+    return markdown;
+  }
+
+  async formatReportAsJson(report: GeneratedReport): Promise<any> {
+    return {
+      metadata: report.metadata,
+      sections: report.sections,
+      summary: report.summary,
+      recommendations: report.recommendations,
+    };
+  }
+
+  // Convenience method for quick statistics
+  async getDataStatistics(data: string): Promise<any> {
     const lines = data.split('\n').filter(line => line.trim().length > 0);
     const headers = lines[0]?.split(',') || [];
     const recordCount = lines.length - 1;
 
+    // Count invalid entries
     const invalidCounts = {
       emails: 0,
       dates: 0,
@@ -1152,153 +1756,5 @@ Data to analyze:
       invalidCounts,
       hasInvalidData: Object.values(invalidCounts).some(count => count > 0),
     };
-  }
-
-  // ==================== JSON PARSING HELPERS ====================
-
-  private parseJSON(output: AIMessage | string, parser: StructuredOutputParser<any>): any {
-    try {
-      let text: string;
-      if (typeof output === 'string') {
-        text = output;
-      } else if (output instanceof AIMessage || (output && typeof output === 'object' && 'content' in output)) {
-        text = output.content as string;
-      } else {
-        console.error('Unexpected output type:', typeof output);
-        text = String(output);
-      }
-
-      let cleaned = text.trim();
-      cleaned = cleaned.replace(/```json\s*/g, '');
-      cleaned = cleaned.replace(/```\s*/g, '');
-      
-      const jsonStart = cleaned.indexOf('{');
-      const jsonEnd = cleaned.lastIndexOf('}');
-      
-      if (jsonStart !== -1 && jsonEnd !== -1) {
-        cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
-      }
-
-      cleaned = this.fixMalformedJSON(cleaned);
-      const parsed = JSON.parse(cleaned);
-      return parsed;
-    } catch (error) {
-      console.error('Failed to parse LLM response:', error.message);
-      
-      try {
-        const text = typeof output === 'string' ? output : (output as AIMessage).content as string;
-        return parser.parse(text);
-      } catch (fallbackError) {
-        console.error('Fallback parser failed, returning defaults');
-        return this.getDefaultResponse();
-      }
-    }
-  }
-
-  private fixMalformedJSON(jsonStr: string): string {
-    try {
-      jsonStr = jsonStr.replace(/\]\s*\n\s*"/g, '],\n"');
-      jsonStr = jsonStr.replace(/\}\s*\n\s*"/g, '},\n"');
-      jsonStr = jsonStr.replace(/(\[|\,)\s*\n\s*([A-Z][^"\[\]\{\},]*?)\s*(?=,|\])/g, (match, prefix, content) => {
-        if (!content.startsWith('"')) {
-          return `${prefix}\n"${content.trim()}"`;
-        }
-        return match;
-      });
-
-      return jsonStr;
-    } catch (error) {
-      console.error('Error fixing malformed JSON:', error.message);
-      return jsonStr;
-    }
-  }
-
-  private getDefaultResponse(): any {
-    console.warn('Using fallback default response');
-    
-    return {
-      insights: ['Unable to parse insights from LLM response'],
-      trends: ['Data analysis in progress'],
-      anomalies: [],
-      recommendations: ['Review data quality and retry'],
-      summary: 'Analysis could not be completed',
-      key_points: ['Parsing error occurred'],
-      data_quality: 'unknown',
-      record_count: 0,
-    };
-  }
-
-  // ==================== CSV HELPERS ====================
-
-  private parseCSV(data: string): { headers: string[], rows: string[][] } {
-    const normalizedData = data.replace(/\\n/g, '\n');
-    const lines = normalizedData.trim().split('\n').filter(line => line.trim());
-    
-    if (lines.length < 2) {
-      throw new Error('Invalid CSV: needs header and at least one row');
-    }
-    
-    const parseCSVLine = (line: string): string[] => {
-      const result: string[] = [];
-      let current = '';
-      let inQuotes = false;
-      
-      for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        const nextChar = line[i + 1];
-        
-        if (char === '"') {
-          if (inQuotes && nextChar === '"') {
-            current += '"';
-            i++;
-          } else {
-            inQuotes = !inQuotes;
-          }
-        } else if (char === ',' && !inQuotes) {
-          result.push(current.trim());
-          current = '';
-        } else {
-          current += char;
-        }
-      }
-      
-      result.push(current.trim());
-      return result;
-    };
-    
-    const headers = parseCSVLine(lines[0]).map(h => h.toLowerCase());
-    const rows = lines.slice(1).map(line => {
-      const cells = parseCSVLine(line);
-      while (cells.length < headers.length) cells.push('');
-      return cells.slice(0, headers.length);
-    });
-    
-    return { headers, rows };
-  }
-
-  private reconstructCSV(headers: string[], rows: string[][]): string {
-    return [headers.join(','), ...rows.map(row => row.join(','))].join('\n');
-  }
-
-  // ==================== FILE UPLOAD ====================
-
-  async processFileUpload(file: Express.Multer.File, request: string): Promise<any> {
-    console.log('=== UNI-AGENT: Processing File Upload ===');
-    
-    const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
-    let text = file.buffer.toString('utf8');
-
-    if (!text?.trim()) {
-      throw new Error('File is empty or unreadable');
-    }
-
-    const context = {
-      filename: file.originalname,
-      fileSize: file.size,
-      fileType: ext,
-      fileData: text,
-    };
-
-    return this.processRequest(request, context);
   }
 }

@@ -7,11 +7,15 @@ import { ChatSession } from './entities/chat_session.entity';
 import { Message } from './entities/message.entity';
 import { KnowledgeBase } from './entities/knowledge_base.entity';
 
-import { UnifiedAgentModule } from './agents/uni-agent/uni-agent.module';
+import { UniAgentModule } from './agents/uni-agent/uni-agent.module';
+import { AuthModule } from './modules/auth/auth.module';
+import { ChatModule } from './modules/chat/chat.module';
+
 @Module({
   imports: [
-    
-    UnifiedAgentModule,
+    AuthModule,
+    ChatModule,
+    UniAgentModule,
     TypeOrmModule.forRoot({
       type: 'postgres',
       host: process.env.DB_HOST,

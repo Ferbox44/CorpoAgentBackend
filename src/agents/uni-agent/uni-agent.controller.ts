@@ -8,426 +8,344 @@ import {
   Get,
   Param,
   Query,
-  HttpCode,
-  HttpStatus,
+  Headers,
+  Res,
+  UseGuards,
+  Request
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { UniAgentService } from './uni-agent.service';
-
-// DTOs for request validation
-class ProcessRequestDto {
-  request: string;
-  context?: any;
-}
-
-class DirectProcessDto {
-  filename: string;
-  tags?: string;
-}
-
-class AnalyzeDataDto {
-  data: string;
-}
+import { JwtAuthGuard } from '../../guards/jwt-auth.guard';
 
 @Controller('uni-agent')
+@UseGuards(JwtAuthGuard)
 export class UniAgentController {
   constructor(private readonly uniAgentService: UniAgentService) {}
 
-  /**
-   * Main endpoint - processes any request with optional context
-   * POST /uni-agent/process
-   * Body: { request: string, context?: any }
-   */
+  // ===== ORCHESTRATOR ENDPOINTS =====
+  
   @Post('process')
-  @HttpCode(HttpStatus.OK)
-  async processRequest(@Body() dto: ProcessRequestDto) {
-    if (!dto.request || dto.request.trim().length === 0) {
-      throw new BadRequestException('Request cannot be empty');
+  async processRequest(
+    @Body() body: {
+      request: string;
+      context?: any;
+    },
+    @Request() req
+  ) {
+    if (!body.request) {
+      throw new BadRequestException('Request is required');
     }
 
-    try {
-      return await this.uniAgentService.processRequest(dto.request, dto.context);
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to process request',
-        error: error.message,
-        details: error.stack,
-      });
-    }
+    // Add user context to the request
+    const contextWithUser = {
+      ...body.context,
+      userId: req.user.userId,
+      userEmail: req.user.email
+    };
+
+    return this.uniAgentService.processRequest(body.request, contextWithUser);
   }
 
-  /**
-   * File upload endpoint - processes uploaded files
-   * POST /uni-agent/upload
-   * Body (multipart/form-data): 
-   *   - file: File
-   *   - request: string (what to do with the file)
-   */
-  @Post('upload')
+  @Post('upload-and-process')
   @UseInterceptors(FileInterceptor('file'))
-  @HttpCode(HttpStatus.OK)
-  async uploadFile(
+  async uploadAndProcess(
     @UploadedFile() file: Express.Multer.File,
-    @Body('request') request: string,
+    @Body() body: { request?: string },
+    @Request() req
   ) {
     if (!file) {
       throw new BadRequestException('No file uploaded');
     }
 
-    if (!request || request.trim().length === 0) {
-      throw new BadRequestException('Request parameter is required');
-    }
+    // Default request if not provided
+    const request = body.request || 'Process and analyze this file, then generate a comprehensive report';
 
-    // Validate file size (max 10MB)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (file.size > maxSize) {
-      throw new BadRequestException('File size exceeds 10MB limit');
-    }
+    // Add user context to the request
+    const contextWithUser = {
+      userId: req.user.userId,
+      userEmail: req.user.email
+    };
 
-    // Validate file type
-    const allowedExtensions = ['csv', 'txt', 'pdf', 'json'];
-    const ext = file.originalname.split('.').pop()?.toLowerCase();
-    if (!ext || !allowedExtensions.includes(ext)) {
-      throw new BadRequestException(
-        `Unsupported file type. Allowed: ${allowedExtensions.join(', ')}`
-      );
-    }
-
-    try {
-      return await this.uniAgentService.processFileUpload(file, request);
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to process uploaded file',
-        error: error.message,
-        filename: file.originalname,
-      });
-    }
+    return this.uniAgentService.processFileUpload(file, request, contextWithUser);
   }
 
-  /**
-   * Quick process endpoint - for simple file processing
-   * POST /uni-agent/process-file
-   * Body: { filename: string, tags?: string }
-   */
-  @Post('process-file')
-  @HttpCode(HttpStatus.OK)
-  async processExistingFile(@Body() dto: DirectProcessDto) {
-    if (!dto.filename || dto.filename.trim().length === 0) {
+  @Post('process-and-report')
+  async processAndReport(
+    @Body() body: {
+      filename: string;
+      recipientEmail?: string;
+    }
+  ) {
+    if (!body.filename) {
       throw new BadRequestException('Filename is required');
     }
 
-    const request = `Process and clean the file named "${dto.filename}"`;
+    return this.uniAgentService.processAndReport(
+      body.filename,
+      body.recipientEmail || 'default@example.com'
+    );
+  }
+
+  @Post('quick-workflow')
+  async quickWorkflow(
+    @Body() body: {
+      workflowType: 'analyze' | 'report' | 'full';
+      recordId?: string;
+      filename?: string;
+    }
+  ) {
+    let request: string;
+
+    switch (body.workflowType) {
+      case 'analyze':
+        request = 'Analyze the data and provide insights';
+        break;
+      case 'report':
+        request = 'Generate a comprehensive report with statistics and insights';
+        break;
+      case 'full':
+        request = 'Process the data, generate a report, and provide actionable recommendations';
+        break;
+      default:
+        throw new BadRequestException('Invalid workflow type');
+    }
+
     const context = {
-      filename: dto.filename,
-      tags: dto.tags,
+      recordId: body.recordId,
+      filename: body.filename,
     };
 
-    try {
-      return await this.uniAgentService.processRequest(request, context);
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to process file',
-        error: error.message,
-        filename: dto.filename,
-      });
-    }
+    return this.uniAgentService.processRequest(request, context);
   }
 
-  /**
-   * Retrieve record by ID
-   * GET /uni-agent/record/:id
-   */
-  @Get('record/:id')
-  async getRecordById(@Param('id') id: string) {
-    if (!id || id.trim().length === 0) {
-      throw new BadRequestException('Record ID is required');
-    }
+  // ===== DATA AGENT ENDPOINTS =====
 
-    const request = `Get the record with ID "${id}"`;
-    const context = { id };
-
-    try {
-      const result = await this.uniAgentService.processRequest(request, context);
-      return result.results?.[0] || result;
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to retrieve record',
-        error: error.message,
-        recordId: id,
-      });
-    }
+  @Get('by-id/:id')
+  async getById(@Param('id') id: string) {
+    return this.uniAgentService.getRecordById(id);
   }
 
-  /**
-   * Retrieve record by filename
-   * GET /uni-agent/record
-   * Query: filename=employees.csv
-   */
-  @Get('record')
-  async getRecordByFilename(@Query('filename') filename: string) {
-    if (!filename || filename.trim().length === 0) {
-      throw new BadRequestException('Filename query parameter is required');
-    }
-
-    const request = `Get the record for file "${filename}"`;
-    const context = { filename };
-
-    try {
-      const result = await this.uniAgentService.processRequest(request, context);
-      return result.results?.[0] || result;
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to retrieve record',
-        error: error.message,
-        filename,
-      });
-    }
+  @Get('by-name/:filename')
+  async getByName(@Param('filename') filename: string) {
+    return this.uniAgentService.findRecordByFilename(filename);
   }
 
-  /**
-   * Analyze data quality without processing
-   * POST /uni-agent/analyze
-   * Body: { data: string }
-   */
-  @Post('analyze')
-  @HttpCode(HttpStatus.OK)
-  async analyzeData(@Body() dto: AnalyzeDataDto) {
-    if (!dto.data || dto.data.trim().length === 0) {
-      throw new BadRequestException('Data cannot be empty');
-    }
-
-    const request = 'Analyze the data quality and provide recommendations';
-    const context = { fileData: dto.data };
-
-    try {
-      return await this.uniAgentService.processRequest(request, context);
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to analyze data',
-        error: error.message,
-      });
-    }
+  @Post("analyze")
+  async analyze(@Body() body: { data: string }) {
+    return await this.uniAgentService.analyzeData(body.data);
   }
 
-  /**
-   * Workflow planning endpoint - plan without executing
-   * POST /uni-agent/plan
-   * Body: { request: string, context?: any }
-   */
-  @Post('plan')
-  @HttpCode(HttpStatus.OK)
-  async planWorkflow(@Body() dto: ProcessRequestDto) {
-    if (!dto.request || dto.request.trim().length === 0) {
-      throw new BadRequestException('Request cannot be empty');
+  @Post('upload')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadFile(@UploadedFile() file: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException('No file uploaded');
     }
 
-    const request = `Plan (but don't execute) the following workflow: ${dto.request}`;
+    console.log('=== FILE UPLOAD DEBUG ===');
+    console.log('Original filename:', file.originalname);
+    console.log('File size:', file.size, 'bytes');
+    console.log('Buffer length:', file.buffer.length);
+
+    // Extract extension and prepare text
+    const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
+    let text = '';
 
     try {
-      // This will trigger planning but we'll intercept before execution
-      const result = await this.uniAgentService.processRequest(request, dto.context);
-      return {
-        plan: result.plan,
-        message: 'Workflow planned successfully. Use /process to execute.',
-      };
+      if (ext === 'csv' || ext === 'txt') {
+        // Use utf8 encoding explicitly
+        text = file.buffer.toString('utf8');
+        console.log('Text extracted (CSV/TXT), length:', text.length);
+        console.log('Number of lines:', text.split('\n').length);
+        console.log('First 300 chars:', text.substring(0, 300));
+        console.log('Last 300 chars:', text.substring(Math.max(0, text.length - 300)));
+      } else if (ext === 'pdf') {
+        const pdfExtractText = require('pdf-parse');
+        const pdfData = await pdfExtractText(file.buffer);
+        text = pdfData.text;
+        console.log('Text extracted (PDF), length:', text.length);
+      } else {
+        // Fallback for unknown extensions
+        text = file.buffer.toString('utf8');
+        console.log('Text extracted (unknown type), length:', text.length);
+      }
     } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to plan workflow',
-        error: error.message,
-      });
+      console.error('Error extracting text from file:', error);
+      throw new BadRequestException(`Failed to extract text from file: ${error.message}`);
     }
-  }
 
-  
+    if (!text || text.trim().length === 0) {
+      throw new BadRequestException('File appears to be empty or could not be read');
+    }
 
-  /**
-   * Health check endpoint
-   * GET /uni-agent/health
-   */
-  @Get('health')
-  async healthCheck() {
+    console.log('=== SENDING TO SERVICE ===');
+    console.log('Text length being sent:', text.length);
+    console.log('First 200 chars of text:', text.substring(0, 200));
+
+    // Call service to analyze, process and save
+    const result = await this.uniAgentService.analyzeAndProcess(
+      text,
+      file.originalname,
+      undefined  // tags should be undefined or a string, not 'No summary yet'
+    );
+
     return {
-      status: 'ok',
-      service: 'uni-agent',
-      timestamp: new Date().toISOString(),
-      message: 'UniAgent service is running',
+      message: 'File processed and saved',
+      recordId: result.recordId,
+      analysis: result.analysis,
+      processedDataPreview: result.processedData.substring(0, 500) + '...',
     };
   }
 
-  /**
-   * Generate report from existing record
-   * POST /uni-agent/report
-   * Body: { recordId?, filename?, reportType? }
-   */
-  @Post('report')
-  @HttpCode(HttpStatus.OK)
+  @Post('upload-test')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadTestFile(@UploadedFile() file: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException('No file uploaded');
+    }
+
+    const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
+    let text = '';
+
+    if (ext === 'csv' || ext === 'txt') {
+      text = file.buffer.toString('utf8');
+    } else if (ext === 'pdf') {
+      const pdfExtractText = require('pdf-parse');
+      const pdfData = await pdfExtractText(file.buffer);
+      text = pdfData.text;
+    } else {
+      text = file.buffer.toString('utf8');
+    }
+
+    // Return raw data without processing for debugging
+    return {
+      filename: file.originalname,
+      fileSize: file.size,
+      extension: ext,
+      textLength: text.length,
+      lineCount: text.split('\n').length,
+      firstLines: text.split('\n').slice(0, 10).join('\n'),
+      lastLines: text.split('\n').slice(-5).join('\n'),
+      fullText: text,  // Be careful with large files!
+    };
+  }
+
+  // ===== REPORT AGENT ENDPOINTS =====
+
+  @Post('generate')
   async generateReport(
-    @Body('recordId') recordId?: string,
-    @Body('filename') filename?: string,
-    @Body('reportType') reportType?: string,
-  ) {
-    if (!recordId && !filename) {
-      throw new BadRequestException('Either recordId or filename is required');
+    @Body() body: {
+      recordId?: string;
+      filename?: string;
+      data?: string;
+      reportType?: string;
     }
-
-    try {
-      return await this.uniAgentService.processRequest(
-        'Generate a comprehensive report',
-        { recordId, filename, reportType }
+  ) {
+    if (!body.recordId && !body.filename && !body.data) {
+      throw new BadRequestException(
+        'Must provide either recordId, filename, or data'
       );
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to generate report',
-        error: error.message,
-      });
     }
+
+    const report = await this.uniAgentService.generateReport(body);
+    return report;
   }
 
-  /**
-   * Generate report and export as PDF/HTML
-   * POST /uni-agent/report/pdf
-   * Body: { recordId?, filename?, reportType? }
-   */
-  @Post('report/pdf')
-  @HttpCode(HttpStatus.OK)
-  async generatePdfReport(
-    @Body('recordId') recordId?: string,
-    @Body('filename') filename?: string,
-    @Body('reportType') reportType?: string,
-  ) {
-    if (!recordId && !filename) {
-      throw new BadRequestException('Either recordId or filename is required');
-    }
-
-    const request = 'Generate a report and export it as PDF';
-    
-    try {
-      return await this.uniAgentService.processRequest(request, {
-        recordId,
-        filename,
-        reportType,
-      });
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to generate PDF report',
-        error: error.message,
-      });
-    }
-  }
-
-  /**
-   * Generate report and export as Markdown
-   * POST /uni-agent/report/markdown
-   * Body: { recordId?, filename?, reportType? }
-   */
-  @Post('report/markdown')
-  @HttpCode(HttpStatus.OK)
-  async generateMarkdownReport(
-    @Body('recordId') recordId?: string,
-    @Body('filename') filename?: string,
-    @Body('reportType') reportType?: string,
-  ) {
-    if (!recordId && !filename) {
-      throw new BadRequestException('Either recordId or filename is required');
-    }
-
-    const request = 'Generate a report and export it as Markdown';
-    
-    try {
-      return await this.uniAgentService.processRequest(request, {
-        recordId,
-        filename,
-        reportType,
-      });
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to generate Markdown report',
-        error: error.message,
-      });
-    }
-  }
-
-  /**
-   * Create a quick summary of data
-   * POST /uni-agent/summary
-   * Body: { recordId?, filename?, data? }
-   */
   @Post('summary')
-  @HttpCode(HttpStatus.OK)
   async createSummary(
-    @Body('recordId') recordId?: string,
-    @Body('filename') filename?: string,
-    @Body('data') data?: string,
+    @Body() body: {
+      recordId?: string;
+      filename?: string;
+      data?: string;
+    }
   ) {
-    if (!recordId && !filename && !data) {
-      throw new BadRequestException('Either recordId, filename, or data is required');
+    if (!body.recordId && !body.filename && !body.data) {
+      throw new BadRequestException(
+        'Must provide either recordId, filename, or data'
+      );
     }
 
-    const request = 'Create a quick summary';
-    
-    try {
-      return await this.uniAgentService.processRequest(request, {
-        recordId,
-        filename,
-        fileData: data,
-      });
-    } catch (error) {
-      throw new BadRequestException({
-        message: 'Failed to create summary',
-        error: error.message,
-      });
-    }
+    const summary = await this.uniAgentService.createSummary(body);
+    return summary;
   }
 
-  /**
-   * Get available actions/capabilities
-   * GET /uni-agent/capabilities
-   */
-  @Get('capabilities')
-  async getCapabilities() {
+  @Post('export/pdf')
+  async exportPdf(
+    @Body() body: {
+      recordId?: string;
+      filename?: string;
+      data?: string;
+      reportType?: string;
+    },
+    @Res() res: Response
+  ) {
+    // First generate the report
+    const report = await this.uniAgentService.generateReport(body);
+    
+    // Then export it as PDF (HTML for now)
+    const html = await this.uniAgentService.exportPdf(report);
+    
+    // Set headers for HTML response (would be PDF in production)
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${report.metadata.title}.html"`
+    );
+    
+    return res.send(html);
+  }
+
+  @Post('export/markdown')
+  async exportMarkdown(
+    @Body() body: {
+      recordId?: string;
+      filename?: string;
+      data?: string;
+      reportType?: string;
+    }
+  ) {
+    const report = await this.uniAgentService.generateReport(body);
+    const markdown = await this.uniAgentService.formatReportAsMarkdown(report);
+    
     return {
-      actions: {
-        retrieval: [
-          'get_by_id - Retrieve a record by its ID',
-          'get_by_filename - Retrieve a record by filename',
-        ],
-        processing: [
-          'analyze_data - Analyze data quality',
-          'clean_data - Remove nulls and format data',
-          'transform_data - Standardize date/email/phone formats',
-          'validate_data - Validate data integrity',
-          'deduplicate_data - Remove duplicate rows',
-          'normalize_data - Normalize text casing',
-        ],
-        storage: [
-          'save_to_database - Save processed data to database',
-        ],
-        reporting: [
-          'generate_report - Create comprehensive report',
-          'create_summary - Create quick summary',
-          'export_pdf - Export report as PDF/HTML',
-          'export_markdown - Export report as Markdown',
-          'export_json - Export report as JSON',
-          'get_statistics - Get basic data statistics',
-        ],
-        workflow: [
-          'plan_workflow - Create multi-step workflow plan',
-          'execute_workflow - Execute a planned workflow',
-        ],
-      },
-      endpoints: {
-        main: 'POST /uni-agent/process',
-        upload: 'POST /uni-agent/upload',
-        retrieve: 'GET /uni-agent/record/:id or GET /uni-agent/record?filename=',
-        analyze: 'POST /uni-agent/analyze',
-        report: 'POST /uni-agent/report',
-        reportPdf: 'POST /uni-agent/report/pdf',
-        reportMarkdown: 'POST /uni-agent/report/markdown',
-        summary: 'POST /uni-agent/summary',
-        batch: 'POST /uni-agent/batch',
-      },
-      supportedFileTypes: ['csv', 'txt', 'pdf', 'json'],
-      maxFileSize: '10MB',
+      filename: `${report.metadata.title}.md`,
+      content: markdown,
     };
+  }
+
+  @Post('export/json')
+  async exportJson(
+    @Body() body: {
+      recordId?: string;
+      filename?: string;
+      data?: string;
+      reportType?: string;
+    }
+  ) {
+    const report = await this.uniAgentService.generateReport(body);
+    const json = await this.uniAgentService.formatReportAsJson(report);
+    
+    return json;
+  }
+
+  @Get('statistics/:id')
+  async getStatistics(@Param('id') id: string) {
+    // This would need to fetch the record first
+    // For now, it's a placeholder
+    return {
+      message: 'Statistics endpoint',
+      id,
+    };
+  }
+
+  @Post('statistics')
+  async getDataStatistics(@Body() body: { data: string }) {
+    if (!body.data) {
+      throw new BadRequestException('Data is required');
+    }
+
+    const stats = await this.uniAgentService.getDataStatistics(body.data);
+    return stats;
   }
 }
