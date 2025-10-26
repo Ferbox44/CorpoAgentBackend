@@ -24,7 +24,7 @@ import { ChatModule } from './modules/chat/chat.module';
       password: process.env.DB_PASSWORD || 'admin',
       database: process.env.DB_NAME || 'corpoagent',
       autoLoadEntities: true,
-      synchronize: true, // Disable in production
+      synchronize: false, // Disable in production
       logging: true,
     }),
 

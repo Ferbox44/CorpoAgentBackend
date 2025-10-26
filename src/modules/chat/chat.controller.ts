@@ -42,13 +42,13 @@ export class ChatController {
     return this.chatService.getMessages(userId);
   }
 
-  @Get('session')
+  @Get('sessions')
   async getSession(@Request() req) {
     const userId = req.user.userId;
     return this.chatService.getSession(userId);
   }
 
-  @Delete('session')
+  @Delete('sessions')
   async clearSession(@Request() req) {
     const userId = req.user.userId;
     return this.chatService.clearSession(userId);

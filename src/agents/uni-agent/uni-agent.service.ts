@@ -572,13 +572,25 @@ Respond with only the JSON object:`;
                 }
                 
                 // Validate salary/amount columns - ONLY in these columns
-                if (header === 'salary' || header === 'amount' || header === 'price' || 
-                    header.includes('salary') || header.includes('amount') || header.includes('price')) {
-                  if (/^\d+(\.\d{3})?$/.test(cell)) {
+                if (
+                  header === 'salary' ||
+                  header === 'amount' ||
+                  header === 'price' ||
+                  header.includes('salary') ||
+                  header.includes('amount') ||
+                  header.includes('price')
+                ) {
+                  // Accept integer and up to two decimal places (commas not allowed), must be positive and not empty
+                  // Disallow non-numeric, negative numbers, excessive decimals, leading zeros (except "0" or "0.xx")
+                  // Allow only values like: "100", "100.5", "0.99", "12000.00"
+                  if (
+                    !/^(?:0|[1-9]\d*)(\.\d{1,2})?$/.test(cell) ||
+                    cell.startsWith('-') ||
+                    cell.trim() === ''
+                  ) {
                     return '[INVALID_AMOUNT]';
                   }
                 }
-                
                 return cell;
               });
             });

@@ -63,8 +63,20 @@ export class ChatService {
     await this.messageRepository.save(aiMessage);
 
     return {
-      userMessage,
-      aiResponse,
+      message: {
+        id: aiMessage.id,
+        sessionId: session.id,
+        content: aiResponse,
+        role: 'agent',
+        timestamp: aiMessage.createdAt.toISOString()
+      },
+      session: {
+        id: session.id,
+        title: session.title,
+        createdAt: session.startedAt.toISOString(),
+        updatedAt: session.lastActivityAt.toISOString(),
+        messageCount: await this.messageRepository.count({ where: { session: { id: session.id } } })
+      }
     };
   }
 
@@ -96,8 +108,20 @@ export class ChatService {
     await this.messageRepository.save(aiMessage);
 
     return {
-      userMessage,
-      aiResponse,
+      message: {
+        id: aiMessage.id,
+        sessionId: session.id,
+        content: aiResponse,
+        role: 'agent',
+        timestamp: aiMessage.createdAt.toISOString()
+      },
+      session: {
+        id: session.id,
+        title: session.title,
+        createdAt: session.startedAt.toISOString(),
+        updatedAt: session.lastActivityAt.toISOString(),
+        messageCount: await this.messageRepository.count({ where: { session: { id: session.id } } })
+      }
     };
   }
 
@@ -109,12 +133,28 @@ export class ChatService {
       order: { createdAt: 'ASC' },
     });
 
-    return messages;
+    return messages.map(message => ({
+      id: message.id,
+      sessionId: session.id,
+      content: message.sender === SenderType.USER ? message.content : JSON.parse(message.content),
+      role: message.sender === SenderType.USER ? 'user' : 'agent',
+      timestamp: message.createdAt.toISOString()
+    }));
   }
 
   async getSession(userId: string) {
     const session = await this.getOrCreateSession(userId);
-    return session;
+    const messageCount = await this.messageRepository.count({ 
+      where: { session: { id: session.id } } 
+    });
+    
+    return {
+      id: session.id,
+      title: session.title,
+      createdAt: session.startedAt.toISOString(),
+      updatedAt: session.lastActivityAt.toISOString(),
+      messageCount
+    };
   }
 
   async clearSession(userId: string) {
