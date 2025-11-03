@@ -10,22 +10,28 @@ import { KnowledgeBase } from './entities/knowledge_base.entity';
 import { UniAgentModule } from './agents/uni-agent/uni-agent.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ChatModule } from './modules/chat/chat.module';
-
+import * as fs from 'fs';
+import { KnowledgeBaseModule } from './modules/knowledge-base/knowledge-base.module';
+const host = process.env.DB_HOST;
 @Module({
   imports: [
     AuthModule,
     ChatModule,
     UniAgentModule,
+    KnowledgeBaseModule,
     TypeOrmModule.forRoot({
+      //Modify for production
       type: 'postgres',
       host: process.env.DB_HOST,
-      port: parseInt(process.env.DB_PORT!) || 5432,
-      username: process.env.DB_USER || 'admin',
-      password: process.env.DB_PASSWORD || 'admin',
-      database: process.env.DB_NAME || 'corpoagent',
+      port: parseInt(process.env.DB_PORT || '5432', 10),
+      username: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
       autoLoadEntities: true,
-      synchronize: false, // Disable in production
+      synchronize: false,
       logging: true,
+      ssl: { rejectUnauthorized: false }
+
     }),
 
     TypeOrmModule.forFeature([User, ChatSession, Message, KnowledgeBase]),
@@ -33,4 +39,15 @@ import { ChatModule } from './modules/chat/chat.module';
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule {
+  constructor() {
+    console.log(process.env.DB_HOST);
+    console.log(process.env.DB_PORT);
+  console.log(process.env.DB_USER);
+  console.log(process.env.DB_PASSWORD);
+  console.log(process.env.DB_NAME);
+  console.log(process.env.DB_SSL);
+  }
+  
+ 
+}

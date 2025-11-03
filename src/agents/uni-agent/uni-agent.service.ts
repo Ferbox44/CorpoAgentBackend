@@ -140,7 +140,7 @@ export class UniAgentService {
       temperature: 0.3,
       apiKey: process.env.GOOGLE_API_KEY || 'your-api-key-here',
     });
-    console.log('Api key used: ', process.env.GOOGLE_API_KEY);
+    
 
     this.setupChains();
     this.setupTools();
@@ -184,6 +184,7 @@ AVAILABLE CAPABILITIES:
      * export_markdown: Export report as Markdown
      * export_json: Export report as JSON
      * get_statistics: Get basic statistics about the data
+     * export_charts: Generate an HTML page with Chart.js charts from the data
 
 TASK PLANNING RULES:
 - If user mentions an EXISTING file/record in the database, use get_by_filename or get_by_id to RETRIEVE it
@@ -200,7 +201,7 @@ PARAMETER PLACEHOLDER SYNTAX:
 - For export tasks that depend on generate_report, use the SAME parameters as the generate_report task
 
 CRITICAL RULES FOR EXPORT TASKS:
-- export_pdf, export_markdown, export_json should use the SAME parameters as the generate_report task they depend on
+- export_pdf, export_markdown, export_json, export_charts should use the SAME parameters as the generate_report task they depend on
 - Do NOT use {{task.X.reportId}} - this field does not exist
 - Use the same recordId, filename, or data parameters that were used in the generate_report task
 
@@ -674,8 +675,183 @@ Respond with only the JSON object:`;
             return data.trim();
           }
         },
+      },
+      {
+        name: "chart",
+        description: "Generates a standalone HTML page with Chart.js charts inferred from CSV data (e.g., department distribution, age distribution, invalid counts, hires per year). Returns an HTML string you can render or save.",
+        call: (data: string): string => {
+          if (!data || typeof data !== 'string') return '<!DOCTYPE html><html><body><p>No data provided.</p></body></html>';
+          try {
+            return this.generateChartsHtml(data);
+          } catch (e) {
+            return `<!DOCTYPE html><html><body><p>Failed to generate charts: ${String((e as any)?.message || e)}</p></body></html>`;
+          }
+        },
       }
     ];
+  }
+
+  private generateChartsHtml(data: string): string {
+    try {
+      const { headers, rows } = parseCSV(data);
+
+      const headerIndex = (name: string) => headers.findIndex(h => h === name || h.includes(name));
+      const departmentIdx = headerIndex('department');
+      const ageIdx = headerIndex('age');
+      const dateIdx = headers.findIndex(h => h === 'hire_date' || h.includes('date'));
+
+      const departmentCounts: Record<string, number> = {};
+      if (departmentIdx !== -1) {
+        for (const row of rows) {
+          const value = (row[departmentIdx] || '').trim();
+          if (!value || value.toLowerCase() === 'unknown' || value.startsWith('[INVALID')) continue;
+          departmentCounts[value] = (departmentCounts[value] || 0) + 1;
+        }
+      }
+
+      const ageBuckets: Record<string, number> = {};
+      if (ageIdx !== -1) {
+        for (const row of rows) {
+          const cell = (row[ageIdx] || '').trim();
+          if (!/^\d+$/.test(cell)) continue;
+          const age = parseInt(cell, 10);
+          if (Number.isNaN(age) || age < 0 || age > 120) continue;
+          const start = Math.floor(age / 5) * 5;
+          const end = start + 4;
+          const label = `${start}-${end}`;
+          ageBuckets[label] = (ageBuckets[label] || 0) + 1;
+        }
+      }
+
+      const yearCounts: Record<string, number> = {};
+      if (dateIdx !== -1) {
+        for (const row of rows) {
+          const cell = (row[dateIdx] || '').trim();
+          const m = cell.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+          if (!m) continue;
+          const year = m[1];
+          yearCounts[year] = (yearCounts[year] || 0) + 1;
+        }
+      }
+
+      const invalidTypes = ['EMAIL', 'DATE', 'AGE', 'PHONE', 'AMOUNT'];
+      const invalidCounts: Record<string, number> = {};
+      for (const t of invalidTypes) {
+        const re = new RegExp(`\\[INVALID_${t}\\]`, 'g');
+        const matches = data.match(re);
+        if (matches && matches.length > 0) invalidCounts[t] = matches.length;
+      }
+
+      const deptLabels = Object.keys(departmentCounts);
+      const deptData = deptLabels.map(l => departmentCounts[l]);
+
+      const ageLabels = Object.keys(ageBuckets)
+        .sort((a, b) => parseInt(a.split('-')[0], 10) - parseInt(b.split('-')[0], 10));
+      const ageData = ageLabels.map(l => ageBuckets[l]);
+
+      const yearLabels = Object.keys(yearCounts).sort();
+      const yearData = yearLabels.map(l => yearCounts[l]);
+
+      const invLabels = Object.keys(invalidCounts);
+      const invData = invLabels.map(l => invalidCounts[l]);
+
+      const chartsPresent = [deptLabels.length, ageLabels.length, yearLabels.length, invLabels.length].some(len => len > 0);
+      if (!chartsPresent) {
+        return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Charts</title></head><body><p>No chartable fields detected. Expected fields similar to example: name, age, email, salary, hire_date, department.</p></body></html>`;
+      }
+
+      const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Data Charts</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; color: #333; max-width: 1100px; margin: 0 auto; padding: 20px; }
+    h1 { color: #2c3e50; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .card h2 { font-size: 16px; margin: 0 0 12px 0; color: #34495e; }
+    canvas { width: 100% !important; height: 260px !important; }
+  </style>
+  </head>
+<body>
+  <h1>Generated Charts</h1>
+  <div class="grid">
+    ${deptLabels.length > 0 ? `
+    <div class="card">
+      <h2>Employees by Department</h2>
+      <canvas id="deptChart"></canvas>
+    </div>` : ''}
+    ${ageLabels.length > 0 ? `
+    <div class="card">
+      <h2>Age Distribution (5-year buckets)</h2>
+      <canvas id="ageChart"></canvas>
+    </div>` : ''}
+    ${yearLabels.length > 0 ? `
+    <div class="card">
+      <h2>Hires per Year</h2>
+      <canvas id="yearChart"></canvas>
+    </div>` : ''}
+    ${invLabels.length > 0 ? `
+    <div class="card">
+      <h2>Invalid Data Counts</h2>
+      <canvas id="invalidChart"></canvas>
+    </div>` : ''}
+  </div>
+
+  <script>
+  document.addEventListener('DOMContentLoaded', function() {
+    ${deptLabels.length > 0 ? `
+    (function(){
+      const ctx = document.getElementById('deptChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: { labels: ${JSON.stringify(deptLabels)}, datasets: [{ label: 'Count', data: ${JSON.stringify(deptData)}, backgroundColor: 'rgba(52, 152, 219, 0.5)', borderColor: 'rgba(52, 152, 219, 1)', borderWidth: 1 }] },
+        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+      });
+    })();` : ''}
+
+    ${ageLabels.length > 0 ? `
+    (function(){
+      const ctx = document.getElementById('ageChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: { labels: ${JSON.stringify(ageLabels)}, datasets: [{ label: 'Employees', data: ${JSON.stringify(ageData)}, backgroundColor: 'rgba(46, 204, 113, 0.5)', borderColor: 'rgba(46, 204, 113, 1)', borderWidth: 1 }] },
+        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+      });
+    })();` : ''}
+
+    ${yearLabels.length > 0 ? `
+    (function(){
+      const ctx = document.getElementById('yearChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: { labels: ${JSON.stringify(yearLabels)}, datasets: [{ label: 'Hires', data: ${JSON.stringify(yearData)}, fill: false, borderColor: 'rgba(231, 76, 60, 1)', backgroundColor: 'rgba(231, 76, 60, 0.2)', tension: 0.2 }] },
+        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+      });
+    })();` : ''}
+
+    ${invLabels.length > 0 ? `
+    (function(){
+      const ctx = document.getElementById('invalidChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: { labels: ${JSON.stringify(invLabels)}, datasets: [{ label: 'Invalids', data: ${JSON.stringify(invData)}, backgroundColor: 'rgba(241, 196, 15, 0.5)', borderColor: 'rgba(241, 196, 15, 1)', borderWidth: 1 }] },
+        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+      });
+    })();` : ''}
+  });
+  </script>
+ </body>
+ </html>
+      `;
+
+      return html;
+    } catch (e) {
+      return `<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Charts</title></head><body><p>Failed to generate charts: ${String(e?.message || e)}</p></body></html>`;
+    }
   }
 
   private parseJSON(output: AIMessage | string, parser: StructuredOutputParser<any>): any {
@@ -839,11 +1015,11 @@ Respond with only the JSON object:`;
 
   async processRequest(request: string, context?: any): Promise<any> {
     console.log('=== UNI-AGENT: Processing Request ===');
-    console.log('Request:', request);
-    console.log('Context:', JSON.stringify(context, null, 2));
+    // console.log('Request:', request);
+    // console.log('Context:', JSON.stringify(context, null, 2));
 
     const plan = await this.planWorkflow(request, context);
-    console.log('Workflow plan:', JSON.stringify(plan, null, 2));
+    // console.log('Workflow plan:', JSON.stringify(plan, null, 2));
 
     const results = await this.executeWorkflow(plan, context);
 
@@ -884,12 +1060,12 @@ Respond with only the JSON object:`;
   }
 
   private async executeWorkflow(plan: WorkflowPlan, context?: any): Promise<any[]> {
-    console.log('=== UNI-AGENT: Executing Workflow ===');
+    // console.log('=== UNI-AGENT: Executing Workflow ===');
     const results: any[] = [];
 
     for (let i = 0; i < plan.tasks.length; i++) {
       const task = plan.tasks[i];
-      console.log(`\nExecuting task ${i + 1}/${plan.tasks.length}:`, task.action);
+      // console.log(`\nExecuting task ${i + 1}/${plan.tasks.length}:`, task.action);
 
       const deps = (task as any).dependencies || [];
       for (const depIdx of deps) {
@@ -908,12 +1084,12 @@ Respond with only the JSON object:`;
         task.status = 'completed';
         task.result = result;
         results.push(result);
-        console.log(`Task ${i + 1} completed successfully`);
+        // console.log(`Task ${i + 1} completed successfully`);
       } catch (error) {
         task.status = 'failed';
         task.error = error.message;
         results.push({ error: error.message });
-        console.error(`Task ${i + 1} failed:`, error.message);
+        // console.error(`Task ${i + 1} failed:`, error.message);
         
         if (task.agent === 'data') {
           throw new Error(`Critical task failed: ${error.message}`);
@@ -925,24 +1101,24 @@ Respond with only the JSON object:`;
   }
 
   private async executeTask(task: AgentTask, previousResults: any[], context?: any): Promise<any> {
-    console.log('\n--- Executing Task ---');
-    console.log('Original params:', JSON.stringify(task.params, null, 2));
-    console.log('Context available:', !!context);
+    // console.log('\n--- Executing Task ---');
+    // console.log('Original params:', JSON.stringify(task.params, null, 2));
+    // console.log('Context available:', !!context);
     
     // First resolve task dependencies
     let params = this.enrichParams(task.params, previousResults);
-    console.log('After task dependency resolution:', JSON.stringify(params, null, 2));
+    // console.log('After task dependency resolution:', JSON.stringify(params, null, 2));
     
     // Handle export tasks that need to inherit parameters from generate_report tasks
     if (this.isExportTask(task.action) && this.hasUnresolvedParams(params)) {
       params = this.inheritParamsFromGenerateReport(task, previousResults, params);
-      console.log('After parameter inheritance:', JSON.stringify(params, null, 2));
+      // console.log('After parameter inheritance:', JSON.stringify(params, null, 2));
     }
     
     // Then inject context values
     if (context) {
       params = this.injectContextIntoParams(params, context);
-      console.log('After context injection:', JSON.stringify(params, null, 2));
+      // console.log('After context injection:', JSON.stringify(params, null, 2));
     }
 
     switch (task.agent) {
@@ -961,7 +1137,7 @@ Respond with only the JSON object:`;
   }
 
   private isExportTask(action: string): boolean {
-    return ['export_pdf', 'export_markdown', 'export_json'].includes(action);
+    return ['export_pdf', 'export_markdown', 'export_json', 'export_charts'].includes(action);
   }
 
   private hasUnresolvedParams(params: any): boolean {
@@ -974,13 +1150,13 @@ Respond with only the JSON object:`;
   }
 
   private inheritParamsFromGenerateReport(task: AgentTask, previousResults: any[], currentParams: any): any {
-    console.log('🔧 Attempting parameter inheritance for export task...');
+    // console.log('Attempting parameter inheritance for export task...');
     
     // Find the most recent generate_report task in the dependency chain
     const generateReportResult = this.findGenerateReportResult(task, previousResults);
     
     if (generateReportResult) {
-      console.log('✓ Found generate_report result, inheriting parameters...');
+      // console.log('✓ Found generate_report result, inheriting parameters...');
       // The generate_report task should have the same parameters we need for export
       // We'll use the same recordId, filename, or data that was used to generate the report
       return {
@@ -1031,7 +1207,7 @@ Respond with only the JSON object:`;
           const [fullMatch, taskIdx, field] = match;
           const taskResult = previousResults[parseInt(taskIdx)];
           if (taskResult && taskResult[field] !== undefined) {
-            console.log(`✓ Replacing ${fullMatch} with result from task ${taskIdx}.${field} = ${taskResult[field]}`);
+            // console.log(`✓ Replacing ${fullMatch} with result from task ${taskIdx}.${field} = ${taskResult[field]}`);
             enriched[key] = taskResult[field];
           } else {
             console.warn(`✗ Could not resolve ${fullMatch}: task result not found or field missing`);
@@ -1052,8 +1228,8 @@ Respond with only the JSON object:`;
   private injectContextIntoParams(params: any, context: any): any {
     const enriched = { ...params };
     
-    console.log('Injecting context into params...');
-    console.log('Available context keys:', Object.keys(context));
+    // console.log('Injecting context into params...');
+    // console.log('Available context keys:', Object.keys(context));
     
     // Resolve context placeholders in param values
     for (const [key, value] of Object.entries(enriched)) {
@@ -1063,7 +1239,7 @@ Respond with only the JSON object:`;
         if (match) {
           const [fullMatch, field] = match;
           if (context[field] !== undefined) {
-            console.log(`✓ Replacing ${fullMatch} with context.${field}`);
+            // console.log(`✓ Replacing ${fullMatch} with context.${field}`);
             enriched[key] = context[field];
           } else {
             console.warn(`✗ Context field "${field}" not found in context`);
@@ -1074,17 +1250,17 @@ Respond with only the JSON object:`;
     
     // Auto-inject common context fields if not already present
     if (context.fileData && !enriched.fileData && !enriched.data) {
-      console.log('✓ Auto-injecting fileData from context');
+      // console.log('✓ Auto-injecting fileData from context');
       enriched.fileData = context.fileData;
     }
     
     if (context.filename && !enriched.filename) {
-      console.log('✓ Auto-injecting filename from context');
+      // console.log('✓ Auto-injecting filename from context');
       enriched.filename = context.filename;
     }
     
     if (context.recordId && !enriched.recordId) {
-      console.log('✓ Auto-injecting recordId from context');
+      // console.log('✓ Auto-injecting recordId from context');
       enriched.recordId = context.recordId;
     }
     
@@ -1092,8 +1268,8 @@ Respond with only the JSON object:`;
   }
 
   private async executeDataTask(action: string, params: any): Promise<any> {
-    console.log('Executing DATA task:', action);
-    console.log('Final params:', JSON.stringify(params, null, 2));
+    // console.log('Executing DATA task:', action);
+    // console.log('Final params:', JSON.stringify(params, null, 2));
     
     switch (action) {
       case 'analyze_data':
@@ -1121,10 +1297,10 @@ Respond with only the JSON object:`;
           throw new Error('No data provided for processing. Ensure fileData or data is in params.');
         }
         
-        console.log('Processing data:');
-        console.log('  - filename:', filename);
-        console.log('  - data length:', data.length);
-        console.log('  - tags:', tags);
+        // console.log('Processing data:');
+        // console.log('  - filename:', filename);
+        // console.log('  - data length:', data.length);
+        // console.log('  - tags:', tags);
         
         return this.analyzeAndProcess(data, filename, tags);
       
@@ -1134,8 +1310,8 @@ Respond with only the JSON object:`;
   }
 
   private async executeReportTask(action: string, params: any): Promise<any> {
-    console.log('Executing REPORT task:', action);
-    console.log('Final params:', JSON.stringify(params, null, 2));
+    // console.log('Executing REPORT task:', action);
+    // console.log('Final params:', JSON.stringify(params, null, 2));
     
     switch (action) {
       case 'generate_report':
@@ -1186,6 +1362,34 @@ Respond with only the JSON object:`;
         });
         return this.formatReportAsJson(jsonReport);
       
+      case 'export_charts':
+        {
+          // Resolve data similar to generateReport
+          let dataStr: string | undefined;
+          if (params.data) {
+            dataStr = params.data;
+          } else if (params.recordId) {
+            const record = await this.knowledgeBaseRepository.findOne({ where: { id: params.recordId } });
+            if (!record) {
+              throw new NotFoundException(`Record with ID ${params.recordId} not found`);
+            }
+            dataStr = record.content;
+          } else if (params.filename) {
+            const record = await this.knowledgeBaseRepository.findOne({ where: { title: params.filename } });
+            if (!record) {
+              throw new NotFoundException(`Record with filename ${params.filename} not found`);
+            }
+            dataStr = record.content;
+          } else {
+            throw new Error('Missing required parameter: recordId, filename, or data');
+          }
+
+          if (!dataStr) {
+            throw new Error('No data available for chart generation');
+          }
+          return this.generateChartsHtml(dataStr);
+        }
+      
       case 'get_statistics':
         if (!params.data) {
           throw new Error('Missing required parameter: data');
@@ -1198,7 +1402,7 @@ Respond with only the JSON object:`;
   }
 
   private async executeAutomationTask(action: string, params: any): Promise<any> {
-    console.log('Executing AUTOMATION task:', action, params);
+    // console.log('Executing AUTOMATION task:', action, params);
     
     // Placeholder - implement when AutomationAgentService is ready
     return {
@@ -1225,12 +1429,12 @@ Respond with only the JSON object:`;
   }
 
   async processFileUpload(file: Express.Multer.File, request: string, userContext?: any): Promise<any> {
-    console.log('=== UNI-AGENT: Processing File Upload ===');
-    console.log('Filename:', file.originalname);
-    console.log('File size:', file.size);
-    console.log('Request:', request);
+    // console.log('=== UNI-AGENT: Processing File Upload ===');
+    // console.log('Filename:', file.originalname);
+    // console.log('File size:', file.size);
+    // console.log('Request:', request);
     if (userContext) {
-      console.log('User Context:', JSON.stringify(userContext, null, 2));
+      // console.log('User Context:', JSON.stringify(userContext, null, 2));
     }
 
     const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
@@ -1254,8 +1458,8 @@ Respond with only the JSON object:`;
       throw new Error('File appears to be empty or could not be read');
     }
 
-    console.log('Extracted text length:', text.length);
-    console.log('First 100 chars:', text.substring(0, 100));
+    // console.log('Extracted text length:', text.length);
+    // console.log('First 100 chars:', text.substring(0, 100));
 
     const context = {
       filename: file.originalname,
@@ -1304,7 +1508,7 @@ Respond with only the JSON object:`;
   async analyzeData(data: string) {
     try {
       const result = await this.dataAnalysisChain.invoke({ data });
-      console.log('Analysis result:', JSON.stringify(result, null, 2));
+      // console.log('Analysis result:', JSON.stringify(result, null, 2));
       return result;
     } catch (error) {
       console.error('Analysis error:', error);
@@ -1313,26 +1517,26 @@ Respond with only the JSON object:`;
   }
 
   async executeActions(data: string, analysis: any) {
-    console.log('Executing actions with analysis:', analysis);
+    // console.log('Executing actions with analysis:', analysis);
     let result = data;
     
     // Execute in proper order: clean → transform → validate
     if (analysis.needs_cleaning) {
-      console.log('Running clean tool...');
+      // console.log('Running clean tool...');
       result = this.tools.find((t) => t.name === "clean")!.call(result);
-      console.log('After cleaning:', result.substring(0, 200));
+      // console.log('After cleaning:', result.substring(0, 200));
     }
     
     if (analysis.needs_transformation) {
-      console.log('Running transform tool...');
+      // console.log('Running transform tool...');
       result = this.tools.find((t) => t.name === "transform")!.call(result);
-      console.log('After transformation:', result.substring(0, 200));
+      // console.log('After transformation:', result.substring(0, 200));
     }
     
     if (analysis.needs_validation) {
-      console.log('Running validate tool...');
+      // console.log('Running validate tool...');
       result = this.tools.find((t) => t.name === "validate")!.call(result);
-      console.log('After validation:', result.substring(0, 200));
+      // console.log('After validation:', result.substring(0, 200));
     }
     
     return result;
@@ -1343,8 +1547,8 @@ Respond with only the JSON object:`;
     fileName: string,
     tags?: string
   ) {
-    console.log('Starting analyzeAndProcess with data length:', data.length);
-    console.log('First 200 chars:', data.substring(0, 200));
+    // console.log('Starting analyzeAndProcess with data length:', data.length);
+    // console.log('First 200 chars:', data.substring(0, 200));
     
     const analysis = await this.analyzeData(data);
     const processedData = await this.executeActions(data, analysis);
@@ -1393,8 +1597,8 @@ Respond with only the JSON object:`;
     data?: string;
     reportType?: string;
   }): Promise<GeneratedReport> {
-    console.log('=== UNI-AGENT: Generating Report ===');
-    console.log('Params:', params);
+    // console.log('=== UNI-AGENT: Generating Report ===');
+    // console.log('Params:', params);
 
     // Get data from various sources
     let data: string;
@@ -1443,17 +1647,17 @@ Respond with only the JSON object:`;
 
     try {
       // Generate summary
-      console.log('Generating summary...');
+      // console.log('Generating summary...');
       const summaryResult = await this.summaryChain.invoke({ data: truncatedData });
-      console.log('Summary generated:', JSON.stringify(summaryResult, null, 2));
+      // console.log('Summary generated:', JSON.stringify(summaryResult, null, 2));
 
       // Generate insights
-      console.log('Generating insights...');
+      // console.log('Generating insights...');
       const insightsResult = await this.insightsChain.invoke({
         data: truncatedData,
         summary: summaryResult.summary || '',
       });
-      console.log('Insights generated:', JSON.stringify(insightsResult, null, 2));
+      // console.log('Insights generated:', JSON.stringify(insightsResult, null, 2));
 
       // Build report sections with defensive checks
       const sections: ReportSection[] = [
@@ -1512,7 +1716,7 @@ Respond with only the JSON object:`;
         recommendations: Array.isArray(insightsResult.recommendations) ? insightsResult.recommendations : [],
       };
 
-      console.log('Report generated successfully');
+      // console.log('Report generated successfully');
       return report;
     } catch (error) {
       console.error('Error generating report:', error);
@@ -1563,7 +1767,7 @@ Respond with only the JSON object:`;
     filename?: string;
     data?: string;
   }): Promise<any> {
-    console.log('=== UNI-AGENT: Creating Summary ===');
+    // console.log('=== UNI-AGENT: Creating Summary ===');
 
     // Get data
     let data: string;
@@ -1596,15 +1800,15 @@ Respond with only the JSON object:`;
   }
 
   async exportPdf(report: GeneratedReport): Promise<string> {
-    console.log('=== UNI-AGENT: Exporting PDF ===');
+    // console.log('=== UNI-AGENT: Exporting PDF ===');
 
     // Generate HTML content for PDF
     const html = this.generateReportHtml(report);
 
     // In a real implementation, you would use a library like puppeteer or pdfkit
     // For now, we'll return the HTML as a placeholder
-    console.log('PDF export would be generated here');
-    console.log('Report title:', report.metadata.title);
+    // console.log('PDF export would be generated here');
+    // console.log('Report title:', report.metadata.title);
 
     return html;
   }

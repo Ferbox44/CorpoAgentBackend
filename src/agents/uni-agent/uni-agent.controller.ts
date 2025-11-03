@@ -143,10 +143,10 @@ export class UniAgentController {
       throw new BadRequestException('No file uploaded');
     }
 
-    console.log('=== FILE UPLOAD DEBUG ===');
-    console.log('Original filename:', file.originalname);
-    console.log('File size:', file.size, 'bytes');
-    console.log('Buffer length:', file.buffer.length);
+    // console.log('=== FILE UPLOAD DEBUG ===');
+    // console.log('Original filename:', file.originalname);
+    // console.log('File size:', file.size, 'bytes');
+    // console.log('Buffer length:', file.buffer.length);
 
     // Extract extension and prepare text
     const ext = file.originalname.split('.').pop()?.toLowerCase() || 'unknown';
@@ -156,19 +156,19 @@ export class UniAgentController {
       if (ext === 'csv' || ext === 'txt') {
         // Use utf8 encoding explicitly
         text = file.buffer.toString('utf8');
-        console.log('Text extracted (CSV/TXT), length:', text.length);
-        console.log('Number of lines:', text.split('\n').length);
-        console.log('First 300 chars:', text.substring(0, 300));
-        console.log('Last 300 chars:', text.substring(Math.max(0, text.length - 300)));
+        // console.log('Text extracted (CSV/TXT), length:', text.length);
+        // console.log('Number of lines:', text.split('\n').length);
+        // console.log('First 300 chars:', text.substring(0, 300));
+        // console.log('Last 300 chars:', text.substring(Math.max(0, text.length - 300)));
       } else if (ext === 'pdf') {
         const pdfExtractText = require('pdf-parse');
         const pdfData = await pdfExtractText(file.buffer);
         text = pdfData.text;
-        console.log('Text extracted (PDF), length:', text.length);
+        // console.log('Text extracted (PDF), length:', text.length);
       } else {
         // Fallback for unknown extensions
         text = file.buffer.toString('utf8');
-        console.log('Text extracted (unknown type), length:', text.length);
+        // console.log('Text extracted (unknown type), length:', text.length);
       }
     } catch (error) {
       console.error('Error extracting text from file:', error);
@@ -179,9 +179,9 @@ export class UniAgentController {
       throw new BadRequestException('File appears to be empty or could not be read');
     }
 
-    console.log('=== SENDING TO SERVICE ===');
-    console.log('Text length being sent:', text.length);
-    console.log('First 200 chars of text:', text.substring(0, 200));
+    // console.log('=== SENDING TO SERVICE ===');
+    // console.log('Text length being sent:', text.length);
+    // console.log('First 200 chars of text:', text.substring(0, 200));
 
     // Call service to analyze, process and save
     const result = await this.uniAgentService.analyzeAndProcess(

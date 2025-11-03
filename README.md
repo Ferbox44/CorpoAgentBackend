@@ -1,98 +1,210 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# CorpoAgent Backend
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend API for CorpoAgent, a corporate AI assistant platform built with NestJS. Provides RESTful endpoints for authentication, user management, intelligent chat, file processing, and knowledge base management.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## 🚀 Features
 
-## Description
+- **🤖 Unified AI Agent System**: Integration with Google Generative AI through LangChain for intelligent data processing
+- **🔐 JWT Authentication**: Secure authentication system with Passport.js and JWT
+- **💬 Intelligent Chat**: Chat system with session management and conversational context
+- **📊 File Processing**: Support for processing CSV, PDF, and text document files
+- **📚 Knowledge Base**: Centralized management of processed documents and extracted insights
+- **👥 User Management**: Complete CRUD for users with data isolation
+- **🗄️ PostgreSQL Database**: Robust persistence with TypeORM
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## 🛠️ Tech Stack
 
-## Project setup
+- **Framework**: NestJS 11.x
+- **Language**: TypeScript
+- **Database**: PostgreSQL with TypeORM
+- **Authentication**: JWT + Passport.js
+- **AI**: LangChain + Google Generative AI
+- **File Processing**: Multer + pdf-parse
+- **Validation**: class-validator + class-transformer
 
+## 📋 Prerequisites
+
+- Node.js (v18 or higher)
+- npm or yarn
+- PostgreSQL (v12 or higher)
+- Google Cloud account with API Key for Generative AI
+
+## 🚀 Installation
+
+1. Clone the repository:
 ```bash
-$ npm install
+git clone <repository-url>
+cd backend
 ```
 
-## Compile and run the project
-
+2. Install dependencies:
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+npm install
 ```
 
-## Run tests
+3. Create a `.env` file in the project root:
+```env
+# Database Configuration
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_NAME=corpoagent_db
 
-```bash
-# unit tests
-$ npm run test
+# JWT Configuration
+JWT_SECRET=your_jwt_secret_key
+JWT_EXPIRES_IN=24h
 
-# e2e tests
-$ npm run test:e2e
+# Google Generative AI
+GOOGLE_API_KEY=your_google_api_key
 
-# test coverage
-$ npm run test:cov
+# Server Configuration
+PORT=3000
+
+# CORS
+CORS_ORIGIN=http://localhost:4200
 ```
 
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+4. Set up PostgreSQL database and create the database:
+```sql
+CREATE DATABASE corpoagent_db;
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+5. Run migrations (if any) or start the server (synchronize: false in production):
+```bash
+npm run start:dev
+```
 
-## Resources
+## 📜 Available Scripts
 
-Check out a few resources that may come in handy when working with NestJS:
+```bash
+# Development
+npm run start:dev          # Start server in development mode with hot-reload
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+# Production
+npm run build              # Build TypeScript project
+npm run start:prod         # Start server in production mode
 
-## Support
+# Testing
+npm run test               # Run unit tests
+npm run test:watch         # Run tests in watch mode
+npm run test:cov           # Run tests with coverage
+npm run test:e2e           # Run end-to-end tests
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+# Code Quality
+npm run lint               # Run ESLint
+npm run format             # Format code with Prettier
+```
 
-## Stay in touch
+## 📁 Project Structure
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+```
+backend/
+├── src/
+│   ├── agents/
+│   │   └── uni-agent/          # Unified AI agent
+│   ├── entities/                # TypeORM entities
+│   │   ├── users.entity.ts
+│   │   ├── chat_session.entity.ts
+│   │   ├── message.entity.ts
+│   │   └── knowledge_base.entity.ts
+│   ├── guards/                  # Authentication guards
+│   │   └── jwt-auth.guard.ts
+│   ├── modules/
+│   │   ├── auth/                # Authentication module
+│   │   ├── users/               # Users module
+│   │   ├── chat/               # Chat module
+│   │   └── knowledge-base/      # Knowledge base module
+│   ├── app.module.ts            # Main module
+│   ├── app.controller.ts        # Main controller
+│   ├── app.service.ts           # Main service
+│   └── main.ts                  # Entry point
+├── dist/                        # Compiled code
+├── docker-compose.yaml          # Docker configuration
+├── package.json
+├── tsconfig.json
+└── README.md
+```
 
-## License
+## 🔌 Main Endpoints
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### Authentication
+- `POST /auth/register` - Register new users
+- `POST /auth/login` - User login
+- `GET /auth/profile` - Get authenticated user profile
+
+### Users
+- `GET /users` - List users (requires authentication)
+- `GET /users/:id` - Get user by ID
+- `PUT /users/:id` - Update user
+- `DELETE /users/:id` - Delete user
+
+### Chat
+- `POST /chat/sessions` - Create new chat session
+- `GET /chat/sessions` - List user sessions
+- `GET /chat/sessions/:id` - Get specific session
+- `POST /chat/messages` - Send message
+- `POST /chat/messages/file` - Send message with file
+- `GET /chat/sessions/:id/messages` - Get messages from a session
+
+### Knowledge Base
+- `GET /knowledge-base` - List knowledge base documents
+- `GET /knowledge-base/:id` - Get specific document
+- `POST /knowledge-base` - Add document to knowledge base
+- `DELETE /knowledge-base/:id` - Delete document
+
+### AI Agent
+- `POST /uni-agent/process` - Process task with AI agent
+- `POST /uni-agent/analyze` - Analyze data with AI agent
+- `POST /uni-agent/generate-report` - Generate report
+
+### Health Check
+- `GET /health` - Server status
+- `GET /` - Basic test endpoint
+
+## 🔒 Security
+
+- All protected routes require JWT authentication
+- Passwords are encrypted with bcrypt
+- Input data validation with class-validator
+- CORS configured for development and production
+- Environment variables for sensitive configuration
+
+## 🐳 Docker
+
+To run with Docker Compose:
+
+```bash
+docker-compose up -d
+```
+
+This will start:
+- PostgreSQL (if configured)
+- pgAdmin on port 5050
+
+## 📝 Development Notes
+
+- The project uses TypeORM with `synchronize: false` in production. Migrations must be handled manually.
+- Database credentials should be in environment variables, never in code.
+- The server listens on `0.0.0.0` to allow external connections.
+- CORS is configured for `http://localhost:4200` by default (Angular frontend).
+
+## 🤝 Contributing
+
+1. Fork the project
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+## 📄 License
+
+This project is private and not licensed for public use.
+
+## 👨‍💻 Author
+
+Developed as part of the CorpoAgent project.
+
+---
+
+**Note**: This backend is designed to work together with the CorpoAgent frontend. Make sure you have the frontend properly configured for a complete experience.
