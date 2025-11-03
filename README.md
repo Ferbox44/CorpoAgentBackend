@@ -33,8 +33,7 @@ Backend API for CorpoAgent, a corporate AI assistant platform built with NestJS.
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd backend
+git clone https://github.com/Ferbox44/CorpoAgentBackend
 ```
 
 2. Install dependencies:
