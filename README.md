@@ -2,6 +2,12 @@
 
 Backend API for CorpoAgent, a corporate AI assistant platform built with NestJS. Provides RESTful endpoints for authentication, user management, intelligent chat, file processing, and knowledge base management.
 
+Note: This project is intended to work with it's frontend project:
+
+```bash
+https://github.com/Ferbox44/CorpoAgentFrontend
+```
+
 ## 🚀 Features
 
 - **🤖 Unified AI Agent System**: Integration with Google Generative AI through LangChain for intelligent data processing
