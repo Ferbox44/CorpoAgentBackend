@@ -2,6 +2,14 @@
 
 Backend API for CorpoAgent, a corporate AI assistant platform built with NestJS. Provides RESTful endpoints for authentication, user management, intelligent chat, file processing, and knowledge base management.
 
+**Access Credentials**
+
+User: ```bash demoprofile@example.com```
+
+Password: ```bash DemoProfile#```
+
+_(Credentials for testing purposes only)_
+
 Note: This project is intended to work with it's frontend project:
 
 ```bash
