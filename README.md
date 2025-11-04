@@ -5,10 +5,10 @@ Backend API for CorpoAgent, a corporate AI assistant platform built with NestJS.
 **Access Credentials**
 
 User: 
-```bash demoprofile@example.com```
+```demoprofile@example.com```
 
 Password: 
-```bash DemoProfile#```
+```DemoProfile#```
 
 _(Credentials for testing purposes only)_
 
